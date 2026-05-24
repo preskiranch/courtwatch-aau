@@ -10,3 +10,5 @@ export * from "./seed-data.js";
 export * from "./exposure-client.js";
 export * from "./public-exposure-page-client.js";
 export * from "./services.js";
+export * from "./tournament-discovery.js";
+export * from "./tournament-eligibility.js";

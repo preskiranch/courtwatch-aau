@@ -5,13 +5,15 @@ import { z } from "zod";
 const EnvSchema = z.object({
   API_BASE_URL: z.string().url().default("http://localhost:4000"),
   ADMIN_SECRET: z.string().optional(),
-  NODE_ENV: z.string().default("development")
+  NODE_ENV: z.string().default("development"),
+  TOURNAMENT_DISCOVERY_INTERVAL_HOURS: z.coerce.number().default(24)
 });
 
 const env = EnvSchema.parse(process.env);
 const logger = pino({ name: "courtwatch-aau-sync-worker" });
 let failureCount = 0;
 let shuttingDown = false;
+let lastDiscoveryAt = 0;
 
 process.on("SIGTERM", () => {
   shuttingDown = true;
@@ -24,6 +26,11 @@ process.on("SIGINT", () => {
 });
 
 async function syncOnce() {
+  try {
+    await discoverTournamentsIfDue();
+  } catch (error) {
+    logger.error({ error: error instanceof Error ? error.message : error }, "tournament discovery failed; continuing with normal sync");
+  }
   const response = await fetch(new URL("/api/admin/sync-now", env.API_BASE_URL), {
     method: "POST",
     headers: {
@@ -38,6 +45,24 @@ async function syncOnce() {
   }
 
   return response.json() as Promise<{ status: string; teamsCount: number; gamesCount: number; changesDetected: number }>;
+}
+
+async function discoverTournamentsIfDue() {
+  const intervalMs = env.TOURNAMENT_DISCOVERY_INTERVAL_HOURS * 60 * 60 * 1000;
+  if (Date.now() - lastDiscoveryAt < intervalMs) return;
+  const response = await fetch(new URL("/api/admin/discover-tournaments", env.API_BASE_URL), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(env.ADMIN_SECRET ? { "x-admin-secret": env.ADMIN_SECRET } : {})
+    },
+    body: JSON.stringify({ source: "worker" })
+  });
+  lastDiscoveryAt = Date.now();
+  if (!response.ok) {
+    throw new Error(`discover-tournaments failed with ${response.status}: ${await response.text()}`);
+  }
+  logger.info(await response.json(), "tournament discovery completed");
 }
 
 async function loop() {

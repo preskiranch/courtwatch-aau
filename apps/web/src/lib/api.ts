@@ -68,7 +68,13 @@ export const CourtWatchApi = {
   deleteAlias: (programId: string, aliasId: string) => apiDelete(`/api/programs/${programId}/aliases/${aliasId}`),
   subscribePush: (subscription: PushSubscription, timezone: string) => apiPost<{ ok: boolean; userId?: string }>("/api/push/subscribe", { subscription, timezone }),
   syncNow: (adminSecret: string, eventId?: number | null) =>
-    apiPost<{ status: string; teamsCount: number; gamesCount: number; changesDetected: number }>(withEvent("/api/admin/sync-now", eventId), {}, { "x-admin-secret": adminSecret })
+    apiPost<{ status: string; teamsCount: number; gamesCount: number; changesDetected: number }>(withEvent("/api/admin/sync-now", eventId), {}, { "x-admin-secret": adminSecret }),
+  discoverTournaments: (adminSecret: string) =>
+    apiPost<{ status: string; discoveredCount: number; syncedCount: number; failures: Array<{ provider: string; source: string; message: string }> }>(
+      "/api/admin/discover-tournaments",
+      {},
+      { "x-admin-secret": adminSecret }
+    )
 };
 
 export function apiBaseUrl() {

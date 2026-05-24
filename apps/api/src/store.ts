@@ -8,10 +8,13 @@ import {
   ScheduleService,
   SELECTED_TEAMS_PROGRAM_ID,
   SELECTED_TEAMS_PROGRAM_NAME,
+  TournamentDiscoveryService,
   buildDashboard,
   buildDivisionResultGroups,
   detectGameChanges,
+  deriveTournamentStatus,
   deriveDivisionResultsFromGames,
+  eligibleTournamentEvents,
   extractDivisionMeta,
   hashSource,
   normalizeName,
@@ -41,11 +44,12 @@ import type {
   ResultPlacement,
   ResultSource,
   Team,
+  PublicTournamentCandidate,
   TournamentEvent
 } from "@courtwatch/core";
 import { fromZonedTime } from "date-fns-tz";
 import { createHash } from "node:crypto";
-import { configuredTournaments, isExposureConfigured, tournamentForExposureEventId } from "./config.js";
+import { config, configuredTournaments, isExposureConfigured, majorTournamentSources, tournamentForExposureEventId } from "./config.js";
 import type { TournamentSource } from "./config.js";
 
 const teamSortCollator = new Intl.Collator("en-US", { numeric: true, sensitivity: "base" });
@@ -66,6 +70,7 @@ export interface CourtWatchStore {
   addAlias(programId: string, alias: string): Promise<ProgramAlias>;
   deleteAlias(programId: string, aliasId: string): Promise<void>;
   syncNow(exposureEventId?: number | null): Promise<{ status: string; source: string; teamsCount: number; gamesCount: number; changesDetected: number }>;
+  discoverTournaments(): Promise<{ status: string; discoveredCount: number; syncedCount: number; failures: Array<{ provider: string; source: string; message: string }> }>;
 }
 
 export class MockStore implements CourtWatchStore {
@@ -76,9 +81,7 @@ export class MockStore implements CourtWatchStore {
   }
 
   async events(): Promise<TournamentEvent[]> {
-    const teamEventIds = new Set(this.data.teams.map((team) => team.eventId));
-    const eventsWithTeams = this.data.events.filter((event) => teamEventIds.has(event.id));
-    return structuredClone(sortTournamentEvents(eventsWithTeams.length > 0 ? eventsWithTeams : this.data.events));
+    return structuredClone(dropdownEventsFromSnapshot(this.data.events, this.data.teams));
   }
 
   async snapshot(exposureEventId?: number | null): Promise<CourtWatchSnapshot> {
@@ -192,10 +195,26 @@ export class MockStore implements CourtWatchStore {
       changesDetected: 0,
       errorMessage: null
     };
-    this.data.events = this.data.events.map((event) => (eventIds.includes(event.id) ? { ...event, lastSyncedAt: run.completedAt } : event));
+    this.data.events = this.data.events.map((event) =>
+      eventIds.includes(event.id)
+        ? {
+            ...event,
+            registeredTeamCount: this.data.teams.filter((team) => team.eventId === event.id).length,
+            hasPublicTeamList: this.data.teams.some((team) => team.eventId === event.id),
+            lastCheckedAt: run.completedAt,
+            lastSyncedAt: run.completedAt,
+            lastTeamChangeAt: event.lastTeamChangeAt ?? run.completedAt,
+            status: deriveTournamentStatus(event)
+          }
+        : event
+    );
     this.data.event = this.data.events.find((event) => event.id === this.data.event.id) ?? this.data.event;
     this.data.syncRuns.unshift(run);
     return { status: run.status, source: run.source, teamsCount: run.teamsCount, gamesCount: run.gamesCount, changesDetected: run.changesDetected };
+  }
+
+  async discoverTournaments() {
+    return { status: "success", discoveredCount: 0, syncedCount: 0, failures: [] };
   }
 
   private snapshotForClient(clientId?: string | null, exposureEventId?: number | null): CourtWatchSnapshot {
@@ -226,10 +245,17 @@ export class PrismaStore implements CourtWatchStore {
   async events(): Promise<TournamentEvent[]> {
     const configured = configuredTournaments();
     const configuredByExposureId = new Map(configured.map((event) => [event.exposureEventId, event]));
-    const [dbEvents, teamCounts] = await Promise.all([
+    const [dbEvents, teamCounts, latestSuccesses] = await Promise.all([
       this.prisma.event.findMany({ orderBy: [{ startDate: "asc" }, { name: "asc" }] }),
-      this.prisma.team.groupBy({ by: ["eventId"], _count: { _all: true } })
+      this.prisma.team.groupBy({ by: ["eventId"], _count: { _all: true } }),
+      this.prisma.syncRun.groupBy({
+        by: ["eventId"],
+        where: { status: "success", completedAt: { not: null } },
+        _max: { completedAt: true }
+      })
     ]);
+    const teamCountByEventId = new Map(teamCounts.map((count) => [count.eventId, count._count._all]));
+    const latestSuccessByEventId = new Map(latestSuccesses.map((run) => [run.eventId, run._max.completedAt?.toISOString() ?? null]));
     const merged = new Map<number, TournamentEvent>();
 
     for (const event of configured) {
@@ -238,25 +264,10 @@ export class PrismaStore implements CourtWatchStore {
 
     for (const event of dbEvents) {
       const source = configuredByExposureId.get(event.exposureEventId);
-      merged.set(event.exposureEventId, {
-        id: event.id,
-        exposureEventId: event.exposureEventId,
-        slug: source?.slug ?? slugFromOfficialUrl(event.officialUrl) ?? String(event.exposureEventId),
-        name: event.name,
-        organizer: event.organizer,
-        startDate: event.startDate.toISOString().slice(0, 10),
-        endDate: event.endDate.toISOString().slice(0, 10),
-        location: event.location,
-        officialUrl: event.officialUrl,
-        timezone: source?.timezone ?? RENO_TIMEZONE,
-        lastSyncedAt: event.lastSyncedAt?.toISOString() ?? null
-      });
+      merged.set(event.exposureEventId, prismaEventToCore(event, source, teamCountByEventId.get(event.id), latestSuccessByEventId.get(event.id) ?? null));
     }
 
-    const eventIdsWithTeams = new Set(teamCounts.filter((count) => count._count._all > 0).map((count) => count.eventId));
-    const allEvents = Array.from(merged.values());
-    const eventsWithTeams = allEvents.filter((event) => eventIdsWithTeams.has(event.id));
-    return sortTournamentEvents(eventsWithTeams.length > 0 ? eventsWithTeams : allEvents);
+    return eligibleTournamentEvents(Array.from(merged.values()), { cacheHours: config.TOURNAMENT_DROPDOWN_CACHE_HOURS });
   }
 
   async snapshot(exposureEventId?: number | null): Promise<CourtWatchSnapshot> {
@@ -282,17 +293,9 @@ export class PrismaStore implements CourtWatchStore {
 
     return {
       event: {
-        id: event.id,
-        exposureEventId: event.exposureEventId,
+        ...prismaEventToCore(event, tournament, teams.length, event.lastSyncedAt?.toISOString() ?? null),
         slug: tournament.slug,
-        name: event.name,
-        organizer: event.organizer,
-        startDate: event.startDate.toISOString().slice(0, 10),
-        endDate: event.endDate.toISOString().slice(0, 10),
-        location: event.location,
-        officialUrl: event.officialUrl,
-        timezone: tournament.timezone,
-        lastSyncedAt: event.lastSyncedAt?.toISOString() ?? null
+        timezone: tournament.timezone
       },
       events: await this.events(),
       divisions: divisions.map((division) => ({
@@ -315,6 +318,8 @@ export class PrismaStore implements CourtWatchStore {
         clubName: team.clubName,
         normalizedClubName: team.normalizedClubName,
         coachName: team.coachName,
+        city: team.city,
+        state: team.state,
         sourceUrl: team.sourceUrl,
         divisionName: team.division?.name ?? null,
         gender: team.division?.gender ?? null,
@@ -322,6 +327,8 @@ export class PrismaStore implements CourtWatchStore {
         level: team.division?.level ?? null,
         rawJson: team.rawJson,
         lastSeenAt: team.lastSeenAt.toISOString(),
+        createdAt: team.createdAt.toISOString(),
+        updatedAt: team.updatedAt.toISOString(),
         playerNames: playerNamesByTeam.get(team.id) ?? [],
         isFollowed: followedTeamIds.has(team.id),
         followerCount: followerCounts.get(team.id) ?? 0
@@ -462,13 +469,17 @@ export class PrismaStore implements CourtWatchStore {
       clubName: team.clubName,
       normalizedClubName: team.normalizedClubName,
       coachName: team.coachName,
+      city: team.city,
+      state: team.state,
       sourceUrl: team.sourceUrl,
       divisionName: team.division?.name ?? null,
       gender: team.division?.gender ?? null,
       gradeLevel: team.division?.gradeLevel ?? null,
       level: team.division?.level ?? null,
       rawJson: team.rawJson,
-      lastSeenAt: team.lastSeenAt.toISOString()
+      lastSeenAt: team.lastSeenAt.toISOString(),
+      createdAt: team.createdAt.toISOString(),
+      updatedAt: team.updatedAt.toISOString()
     };
   }
 
@@ -547,7 +558,33 @@ export class PrismaStore implements CourtWatchStore {
     return aggregateSyncResults(results);
   }
 
-  private async syncTournament(tournament: TournamentSource) {
+  async discoverTournaments() {
+    await this.markCompletedEvents();
+    const result = await new TournamentDiscoveryService().discover(majorTournamentSources());
+    const syncResults = [];
+    for (const candidate of result.candidates) {
+      syncResults.push(await this.syncTournament(candidate.event, candidate.teams));
+    }
+    for (const failure of result.failures) {
+      console.warn("Tournament discovery source skipped", failure);
+    }
+    return {
+      status: syncResults.every((item) => item.status === "success") ? "success" : "failed",
+      discoveredCount: result.candidates.length,
+      syncedCount: syncResults.length,
+      failures: result.failures
+    };
+  }
+
+  private async markCompletedEvents() {
+    const today = process.env.COURTWATCH_TODAY ? new Date(`${process.env.COURTWATCH_TODAY}T00:00:00.000Z`) : new Date();
+    await this.prisma.event.updateMany({
+      where: { endDate: { lt: today }, status: { notIn: ["completed", "cancelled"] } },
+      data: { status: "completed" }
+    });
+  }
+
+  private async syncTournament(tournament: TournamentSource, preloadedTeams?: PublicTournamentCandidate["teams"]) {
     const startedAt = new Date();
     const source = isExposureConfigured() ? "exposure_api" : "public_page";
     let teamsCount = 0;
@@ -560,11 +597,13 @@ export class PrismaStore implements CourtWatchStore {
     });
 
     try {
-      const sourceTeams = await fetchSourceTeams(tournament);
+      const sourceTeams = preloadedTeams ?? (await fetchSourceTeams(tournament));
       const mockDataEnabled = process.env.ENABLE_MOCK_DATA === "true";
       const includeMockArsenal = process.env.ENABLE_MOCK_ARSENAL === "true";
+      const usingMockFallback = mockDataEnabled && sourceTeams.teams.length === 0;
       await ensurePrograms(this.prisma);
-      if (mockDataEnabled && sourceTeams.teams.length === 0) {
+      const previousTeamIds = await loadEventTeamExternalIds(this.prisma, event.id);
+      if (usingMockFallback) {
         await upsertSeedDivisionsTeamsAndGames(this.prisma, event.id, includeMockArsenal);
       } else {
         await removeSeedGameAndChangeData(this.prisma);
@@ -577,6 +616,7 @@ export class PrismaStore implements CourtWatchStore {
       for (const team of sourceTeams.teams) {
         await upsertTeam(this.prisma, event.id, team);
       }
+      if (!usingMockFallback) await removeTeamsMissingFromPublicList(this.prisma, event.id, sourceTeams.teams);
 
       const teamMap = await loadTeamMap(this.prisma, event.id);
       const sourcePlayers = await fetchSourcePlayers(event.id, teamMap, tournament);
@@ -621,7 +661,18 @@ export class PrismaStore implements CourtWatchStore {
       const after = await this.snapshot(tournament.exposureEventId);
       teamsCount = after.teams.length;
       gamesCount = after.games.length;
-      await this.prisma.event.update({ where: { id: event.id }, data: { lastSyncedAt: new Date() } });
+      const syncedAt = new Date();
+      await this.prisma.event.update({
+        where: { id: event.id },
+        data: {
+          registeredTeamCount: teamsCount,
+          hasPublicTeamList: sourceTeams.teams.length > 0,
+          lastCheckedAt: syncedAt,
+          lastSyncedAt: syncedAt,
+          lastTeamChangeAt: haveTeamExternalIdsChanged(previousTeamIds, sourceTeams.teams) ? syncedAt : undefined,
+          status: deriveTournamentStatus({ startDate: tournament.startDate, endDate: tournament.endDate, status: tournament.status })
+        }
+      });
       await this.prisma.syncRun.update({
         where: { id: run.id },
         data: {
@@ -644,6 +695,13 @@ export class PrismaStore implements CourtWatchStore {
           gamesCount,
           changesDetected,
           errorMessage: error instanceof Error ? error.message : "Unknown sync error"
+        }
+      });
+      await this.prisma.event.update({
+        where: { id: event.id },
+        data: {
+          lastCheckedAt: new Date(),
+          status: deriveTournamentStatus({ startDate: tournament.startDate, endDate: tournament.endDate, status: tournament.status })
         }
       });
       throw error;
@@ -711,6 +769,7 @@ function snapshotForTournament(snapshot: CourtWatchSnapshot, exposureEventId?: n
   return {
     ...snapshot,
     event,
+    events: dropdownEventsFromSnapshot(snapshot.events, snapshot.teams),
     divisions: snapshot.divisions.filter((division) => division.eventId === event.id),
     teams: snapshot.teams.filter((team) => team.eventId === event.id),
     players: snapshot.players.filter((player) => player.eventId === event.id),
@@ -750,6 +809,86 @@ function emptySnapshotForTournament(tournament: TournamentSource, events: Tourna
 
 function sortTournamentEvents(events: TournamentEvent[]): TournamentEvent[] {
   return [...events].sort((left, right) => left.startDate.localeCompare(right.startDate) || left.name.localeCompare(right.name));
+}
+
+function dropdownEventsFromSnapshot(events: TournamentEvent[], teams: Team[]): TournamentEvent[] {
+  const teamCounts = new Map<string, number>();
+  for (const team of teams) teamCounts.set(team.eventId, (teamCounts.get(team.eventId) ?? 0) + 1);
+  return eligibleTournamentEvents(
+    events.map((event) => ({
+      ...event,
+      registeredTeamCount: teamCounts.get(event.id) ?? 0,
+      hasPublicTeamList: event.hasPublicTeamList && (teamCounts.get(event.id) ?? 0) > 0
+    })),
+    { cacheHours: config.TOURNAMENT_DROPDOWN_CACHE_HOURS }
+  );
+}
+
+function prismaEventToCore(
+  event: {
+    id: string;
+    exposureEventId: number;
+    externalProvider: string;
+    externalId: string;
+    sourceUrl: string | null;
+    name: string;
+    organizer: string;
+    sport: string;
+    sanctioningTags: string[];
+    gender: string | null;
+    ageOrGradeDivisions: string[];
+    venueName: string | null;
+    city: string | null;
+    state: string | null;
+    region: string | null;
+    startDate: Date;
+    endDate: Date;
+    location: string;
+    officialUrl: string;
+    registeredTeamCount: number;
+    hasPublicTeamList: boolean;
+    lastCheckedAt: Date | null;
+    lastSyncedAt: Date | null;
+    lastTeamChangeAt: Date | null;
+    status: string;
+  },
+  source?: TournamentSource | null,
+  teamCount: number | null = null,
+  latestSuccessfulSyncAt: string | null = event.lastSyncedAt?.toISOString() ?? null
+): TournamentEvent {
+  const startDate = event.startDate.toISOString().slice(0, 10);
+  const endDate = event.endDate.toISOString().slice(0, 10);
+  const status = deriveTournamentStatus({ startDate, endDate, status: event.status as TournamentEvent["status"] });
+  return {
+    id: event.id,
+    exposureEventId: event.exposureEventId,
+    externalProvider: event.externalProvider,
+    externalId: event.externalId,
+    slug: source?.slug ?? slugFromOfficialUrl(event.officialUrl) ?? String(event.exposureEventId),
+    sourceUrl: event.sourceUrl ?? event.officialUrl,
+    name: event.name,
+    organizer: event.organizer,
+    sport: event.sport,
+    sanctioningTags: event.sanctioningTags,
+    gender: event.gender,
+    ageOrGradeDivisions: event.ageOrGradeDivisions,
+    venueName: event.venueName,
+    city: event.city,
+    state: event.state,
+    region: event.region,
+    startDate,
+    endDate,
+    location: event.location,
+    officialUrl: event.officialUrl,
+    timezone: source?.timezone ?? RENO_TIMEZONE,
+    registeredTeamCount: teamCount ?? event.registeredTeamCount,
+    hasPublicTeamList: event.hasPublicTeamList && (teamCount ?? event.registeredTeamCount) > 0,
+    lastCheckedAt: event.lastCheckedAt?.toISOString() ?? null,
+    lastSyncedAt: latestSuccessfulSyncAt ?? event.lastSyncedAt?.toISOString() ?? null,
+    lastTeamChangeAt: event.lastTeamChangeAt?.toISOString() ?? null,
+    status,
+    dropdownGroup: source ? "tracked" : "upcoming"
+  };
 }
 
 function aggregateSyncResults(results: Array<{ status: string; source: string; teamsCount: number; gamesCount: number; changesDetected: number }>) {
@@ -907,23 +1046,55 @@ async function upsertEvent(prisma: PrismaClient, tournament: TournamentSource) {
   return prisma.event.upsert({
     where: { exposureEventId: tournament.exposureEventId },
     update: {
+      externalProvider: tournament.externalProvider,
+      externalId: tournament.externalId,
+      sourceUrl: tournament.sourceUrl,
       name: tournament.name,
       organizer: tournament.organizer,
-      startDate: new Date(`${tournament.startDate}T00:00:00.000Z`),
-      endDate: new Date(`${tournament.endDate}T00:00:00.000Z`),
-      location: tournament.location,
-      officialUrl: tournament.officialUrl
-    },
-    create: {
-      id: tournament.id,
-      exposureEventId: tournament.exposureEventId,
-      name: tournament.name,
-      organizer: tournament.organizer,
+      sport: tournament.sport,
+      sanctioningTags: tournament.sanctioningTags,
+      gender: tournament.gender,
+      ageOrGradeDivisions: tournament.ageOrGradeDivisions,
+      venueName: tournament.venueName,
+      city: tournament.city,
+      state: tournament.state,
+      region: tournament.region,
       startDate: new Date(`${tournament.startDate}T00:00:00.000Z`),
       endDate: new Date(`${tournament.endDate}T00:00:00.000Z`),
       location: tournament.location,
       officialUrl: tournament.officialUrl,
-      lastSyncedAt: tournament.lastSyncedAt ? new Date(tournament.lastSyncedAt) : null
+      registeredTeamCount: tournament.registeredTeamCount > 0 ? tournament.registeredTeamCount : undefined,
+      hasPublicTeamList: tournament.hasPublicTeamList || undefined,
+      lastCheckedAt: tournament.lastCheckedAt ? new Date(tournament.lastCheckedAt) : undefined,
+      lastTeamChangeAt: tournament.lastTeamChangeAt ? new Date(tournament.lastTeamChangeAt) : undefined,
+      status: tournament.status
+    },
+    create: {
+      id: tournament.id,
+      exposureEventId: tournament.exposureEventId,
+      externalProvider: tournament.externalProvider,
+      externalId: tournament.externalId,
+      sourceUrl: tournament.sourceUrl,
+      name: tournament.name,
+      organizer: tournament.organizer,
+      sport: tournament.sport,
+      sanctioningTags: tournament.sanctioningTags,
+      gender: tournament.gender,
+      ageOrGradeDivisions: tournament.ageOrGradeDivisions,
+      venueName: tournament.venueName,
+      city: tournament.city,
+      state: tournament.state,
+      region: tournament.region,
+      startDate: new Date(`${tournament.startDate}T00:00:00.000Z`),
+      endDate: new Date(`${tournament.endDate}T00:00:00.000Z`),
+      location: tournament.location,
+      officialUrl: tournament.officialUrl,
+      registeredTeamCount: tournament.registeredTeamCount,
+      hasPublicTeamList: tournament.hasPublicTeamList,
+      lastCheckedAt: tournament.lastCheckedAt ? new Date(tournament.lastCheckedAt) : null,
+      lastSyncedAt: tournament.lastSyncedAt ? new Date(tournament.lastSyncedAt) : null,
+      lastTeamChangeAt: tournament.lastTeamChangeAt ? new Date(tournament.lastTeamChangeAt) : null,
+      status: tournament.status
     }
   });
 }
@@ -1089,6 +1260,8 @@ async function upsertTeam(prisma: PrismaClient, eventId: string, team: Team) {
       clubName: team.clubName,
       normalizedClubName: team.clubName ? normalizeName(team.clubName) : null,
       coachName: team.coachName,
+      city: team.city ?? null,
+      state: team.state ?? null,
       sourceUrl: team.sourceUrl,
       rawJson: (team.rawJson ?? {}) as object,
       lastSeenAt: new Date()
@@ -1103,9 +1276,35 @@ async function upsertTeam(prisma: PrismaClient, eventId: string, team: Team) {
       clubName: team.clubName,
       normalizedClubName: team.clubName ? normalizeName(team.clubName) : null,
       coachName: team.coachName,
+      city: team.city ?? null,
+      state: team.state ?? null,
       sourceUrl: team.sourceUrl,
       rawJson: (team.rawJson ?? {}) as object,
       lastSeenAt: new Date(team.lastSeenAt)
+    }
+  });
+}
+
+async function loadEventTeamExternalIds(prisma: PrismaClient, eventId: string): Promise<Set<string>> {
+  const teams = await prisma.team.findMany({ where: { eventId }, select: { id: true, exposureTeamId: true } });
+  return new Set(teams.map((team) => team.exposureTeamId ?? team.id));
+}
+
+function haveTeamExternalIdsChanged(previousTeamIds: Set<string>, teams: Team[]): boolean {
+  const nextTeamIds = new Set(teams.map((team) => team.exposureTeamId ?? team.id));
+  if (previousTeamIds.size !== nextTeamIds.size) return true;
+  for (const teamId of nextTeamIds) {
+    if (!previousTeamIds.has(teamId)) return true;
+  }
+  return false;
+}
+
+async function removeTeamsMissingFromPublicList(prisma: PrismaClient, eventId: string, teams: Team[]) {
+  const externalIds = teams.map((team) => team.exposureTeamId ?? team.id).filter(Boolean);
+  await prisma.team.deleteMany({
+    where: {
+      eventId,
+      exposureTeamId: externalIds.length > 0 ? { notIn: externalIds } : { not: null }
     }
   });
 }
@@ -1230,13 +1429,17 @@ async function loadTeamMap(prisma: PrismaClient, eventId: string): Promise<Map<s
         clubName: team.clubName,
         normalizedClubName: team.normalizedClubName,
         coachName: team.coachName,
+        city: team.city,
+        state: team.state,
         sourceUrl: team.sourceUrl,
         divisionName: team.division?.name ?? null,
         gender: team.division?.gender ?? null,
         gradeLevel: team.division?.gradeLevel ?? null,
         level: team.division?.level ?? null,
         rawJson: team.rawJson,
-        lastSeenAt: team.lastSeenAt.toISOString()
+        lastSeenAt: team.lastSeenAt.toISOString(),
+        createdAt: team.createdAt.toISOString(),
+        updatedAt: team.updatedAt.toISOString()
       };
       return [
         [team.id, coreTeam],

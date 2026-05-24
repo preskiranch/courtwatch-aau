@@ -368,6 +368,18 @@ export function createApp(store: CourtWatchStore, prismaClient: PrismaClient | n
     }
   });
 
+  app.post("/api/admin/discover-tournaments", async (req, res, next) => {
+    try {
+      if (!isAdminAuthorized(req.headers.authorization, req.headers["x-admin-secret"])) {
+        res.status(401).json({ error: "Invalid admin secret" });
+        return;
+      }
+      res.json(await store.discoverTournaments());
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     const status = error instanceof z.ZodError ? 400 : 500;
     const message = error instanceof z.ZodError ? error.flatten() : error instanceof Error ? error.message : "Unknown error";

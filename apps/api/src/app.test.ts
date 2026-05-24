@@ -1,11 +1,19 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import request from "supertest";
 import { normalizeName, seedGames, seedSnapshot } from "@courtwatch/core";
-import type { Game } from "@courtwatch/core";
+import type { Game, Team, TournamentEvent } from "@courtwatch/core";
 import { createApp } from "./app.js";
 import { MockStore } from "./store.js";
 
 describe("CourtWatch API", () => {
+  beforeEach(() => {
+    process.env.COURTWATCH_TODAY = "2026-05-24";
+  });
+
+  afterEach(() => {
+    delete process.env.COURTWATCH_TODAY;
+  });
+
   it("returns a dashboard response", async () => {
     const app = createApp(new MockStore(), null);
     const response = await request(app).get("/api/dashboard").expect(200);
@@ -39,14 +47,71 @@ describe("CourtWatch API", () => {
       ...seedSnapshot.event,
       id: "event-empty-aau-2026",
       exposureEventId: 910000,
+      externalId: "910000",
       slug: "empty-aau-classic",
       name: "Empty AAU Classic",
+      sourceUrl: "https://basketball.exposureevents.com/910000/empty-aau-classic",
       officialUrl: "https://basketball.exposureevents.com/910000/empty-aau-classic",
+      registeredTeamCount: 0,
+      hasPublicTeamList: true,
       lastSyncedAt: null
     });
     const app = createApp(new MockStore(snapshot), null);
     const events = await request(app).get("/api/events").expect(200);
     expect(events.body.map((event: { exposureEventId: number }) => event.exposureEventId)).toEqual([255539, 900001]);
+  });
+
+  it("only returns eligible dropdown tournaments from public team-list sources", async () => {
+    const eligible = eventFixture(910001, {
+      name: "Jam On It Memorial Day Classic",
+      organizer: "Jam On It",
+      city: "Reno",
+      state: "Nevada",
+      startDate: "2026-05-25",
+      endDate: "2026-05-27",
+      hasPublicTeamList: true,
+      status: "upcoming"
+    });
+    const duplicate = eventFixture(910001, {
+      id: "event-duplicate-jam-on-it",
+      name: "Jam On It Memorial Day Classic Duplicate",
+      startDate: "2026-05-25",
+      hasPublicTeamList: true
+    });
+    const farAway = eventFixture(910002, { name: "Too Far Classic", startDate: "2026-07-01", endDate: "2026-07-02", hasPublicTeamList: true });
+    const noPublicTeams = eventFixture(910003, { name: "AAU Event Finder Listing", externalProvider: "aau_event_finder", hasPublicTeamList: false });
+    const zeroTeams = eventFixture(910004, { name: "Zero Team Classic", hasPublicTeamList: true });
+    const completed = eventFixture(910005, { name: "Completed Classic", startDate: "2026-05-20", endDate: "2026-05-21", hasPublicTeamList: true, status: "completed" });
+    const cancelled = eventFixture(910006, { name: "Cancelled Classic", hasPublicTeamList: true, status: "cancelled" });
+    const unavailable = eventFixture(910007, { name: "Unavailable Classic", hasPublicTeamList: true, status: "unavailable" });
+    const snapshot = {
+      ...structuredClone(seedSnapshot),
+      event: eligible,
+      events: [eligible, duplicate, farAway, noPublicTeams, zeroTeams, completed, cancelled, unavailable],
+      teams: [teamFixture(eligible), teamFixture(duplicate), teamFixture(farAway), teamFixture(noPublicTeams), teamFixture(completed), teamFixture(cancelled), teamFixture(unavailable)]
+    };
+    const app = createApp(new MockStore(snapshot), null);
+    const events = await request(app).get("/api/events").expect(200);
+
+    expect(events.body.map((event: { name: string }) => event.name)).toEqual(["Jam On It Memorial Day Classic"]);
+    expect(events.body[0]).toMatchObject({
+      name: "Jam On It Memorial Day Classic",
+      registeredTeamCount: 1,
+      hasPublicTeamList: true
+    });
+  });
+
+  it("returns an empty dropdown list when no upcoming public team-list tournaments are eligible", async () => {
+    const privateEvent = eventFixture(920001, { name: "Private Team List Classic", hasPublicTeamList: false });
+    const snapshot = {
+      ...structuredClone(seedSnapshot),
+      event: privateEvent,
+      events: [privateEvent],
+      teams: [teamFixture(privateEvent)]
+    };
+    const app = createApp(new MockStore(snapshot), null);
+    const events = await request(app).get("/api/events").expect(200);
+    expect(events.body).toEqual([]);
   });
 
   it("lets a user follow and unfollow a selected team", async () => {
@@ -182,3 +247,38 @@ describe("CourtWatch API", () => {
     delete process.env.ADMIN_SECRET;
   });
 });
+
+function eventFixture(exposureEventId: number, overrides: Partial<TournamentEvent> = {}): TournamentEvent {
+  const slug = overrides.slug ?? `event-${exposureEventId}`;
+  return {
+    ...seedSnapshot.event,
+    id: overrides.id ?? `event-${exposureEventId}`,
+    exposureEventId,
+    externalProvider: overrides.externalProvider ?? "exposure_events",
+    externalId: overrides.externalId ?? String(exposureEventId),
+    slug,
+    sourceUrl: overrides.sourceUrl ?? `https://basketball.exposureevents.com/${exposureEventId}/${slug}`,
+    name: overrides.name ?? `Event ${exposureEventId}`,
+    startDate: overrides.startDate ?? "2026-05-25",
+    endDate: overrides.endDate ?? "2026-05-26",
+    officialUrl: overrides.officialUrl ?? `https://basketball.exposureevents.com/${exposureEventId}/${slug}`,
+    registeredTeamCount: overrides.registeredTeamCount ?? 0,
+    hasPublicTeamList: overrides.hasPublicTeamList ?? true,
+    lastCheckedAt: overrides.lastCheckedAt ?? "2026-05-24T12:00:00.000Z",
+    lastSyncedAt: overrides.lastSyncedAt ?? "2026-05-24T12:00:00.000Z",
+    lastTeamChangeAt: overrides.lastTeamChangeAt ?? "2026-05-24T12:00:00.000Z",
+    status: overrides.status ?? "upcoming",
+    ...overrides
+  };
+}
+
+function teamFixture(event: TournamentEvent): Team {
+  const baseTeam = seedSnapshot.teams[0]!;
+  return {
+    ...baseTeam,
+    id: `team-${event.exposureEventId}-${baseTeam.exposureTeamId}`,
+    eventId: event.id,
+    exposureTeamId: `${event.exposureEventId}-${baseTeam.exposureTeamId}`,
+    sourceUrl: event.officialUrl
+  };
+}

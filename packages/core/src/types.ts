@@ -32,19 +32,37 @@ export type ChangeEventType =
 export type ResultPlacement = 1 | 2 | 3;
 export type ResultMedalLabel = "Gold" | "Silver" | "Bronze";
 export type ResultSource = "official_standings" | "bracket_final" | "manual_admin";
+export type TournamentEventStatus = "upcoming" | "active" | "completed" | "unavailable" | "cancelled";
 
 export interface TournamentEvent {
   id: string;
   exposureEventId: number;
+  externalProvider: string;
+  externalId: string;
   slug: string;
+  sourceUrl: string;
   name: string;
   organizer: string;
+  sport: string;
+  sanctioningTags: string[];
+  gender: string | null;
+  ageOrGradeDivisions: string[];
+  venueName: string | null;
+  city: string | null;
+  state: string | null;
+  region: string | null;
   startDate: string;
   endDate: string;
   location: string;
   officialUrl: string;
   timezone: string;
+  registeredTeamCount: number;
+  hasPublicTeamList: boolean;
+  lastCheckedAt: string | null;
   lastSyncedAt: string | null;
+  lastTeamChangeAt: string | null;
+  status: TournamentEventStatus;
+  dropdownGroup?: "tracked" | "upcoming";
 }
 
 export interface Division {
@@ -68,6 +86,8 @@ export interface Team {
   clubName: string | null;
   normalizedClubName: string | null;
   coachName: string | null;
+  city?: string | null;
+  state?: string | null;
   sourceUrl: string | null;
   divisionName?: string | null;
   gender?: string | null;
@@ -75,6 +95,8 @@ export interface Team {
   level?: string | null;
   rawJson?: unknown;
   lastSeenAt: string;
+  createdAt?: string;
+  updatedAt?: string;
   playerNames?: string[];
   isFollowed?: boolean;
   followerCount?: number;

@@ -8,7 +8,8 @@ The original `courtwatch-reno` folder is not modified by this app.
 
 - Adds `GET /api/events` and `?eventId=` scoping on dashboard, teams, games, alerts, results, and current-event routes.
 - Supports an `EXPOSURE_EVENTS` JSON array for multiple tournaments.
-- The tournament selector shows tournaments with registered team data. On a fresh empty database it falls back to configured tournaments so the first sync can be run.
+- The tournament selector shows only tournaments with public registered team data and at least one registered team.
+- Adds provider-based public discovery for upcoming major youth basketball tournaments, starting with Exposure/Jam On It-style sources.
 - Keeps followed teams scoped by tournament view, so following a team in one event does not show it in another event dashboard.
 - Prefixes public Exposure IDs with the event id to avoid cross-tournament team/game id collisions.
 - Admin sync runs every configured tournament by default, or one event when `eventId` is provided.
@@ -16,7 +17,7 @@ The original `courtwatch-reno` folder is not modified by this app.
 
 ## Configure Tournaments
 
-Use `EXPOSURE_EVENTS` for production. Each object needs the Exposure event id and public slug:
+Use `EXPOSURE_EVENTS` for manually tracked production events. Each object needs the Exposure event id and public slug:
 
 ```bash
 EXPOSURE_EVENTS='[
@@ -35,6 +36,41 @@ DEFAULT_EXPOSURE_EVENT_ID=255539
 ```
 
 If `EXPOSURE_EVENTS` is empty, the app falls back to legacy `EXPOSURE_EVENT_ID` and `EXPOSURE_EVENT_SLUG`.
+
+## Public Discovery
+
+The worker calls `POST /api/admin/discover-tournaments` at least daily. Discovery looks from today through today plus 30 days and only saves dropdown-eligible tournaments when:
+
+- the source is public and does not require login, payment, CAPTCHA bypass, private API access, or organizer-only permission
+- the event is basketball from an enabled AAU/major tournament source
+- the event is upcoming or active, not completed/cancelled/unavailable
+- the provider exposes a public registered-team list
+- at least one registered team is fetched
+
+Default sources are configured in `MAJOR_TOURNAMENT_SOURCES`:
+
+```bash
+MAJOR_TOURNAMENT_SOURCES='[
+  {
+    "name": "Jam On It",
+    "provider": "exposure_events",
+    "enabled": true,
+    "url": "https://basketball.exposureevents.com/organizations/3461/jam-on-it",
+    "organizerName": "Jam On It",
+    "sanctioningTags": ["Jam On It", "Exposure Events"],
+    "timezone": "America/Los_Angeles"
+  },
+  {
+    "name": "AAU Event Finder",
+    "provider": "aau_event_finder",
+    "enabled": true,
+    "organizerName": "AAU",
+    "sanctioningTags": ["AAU"]
+  }
+]'
+```
+
+The AAU adapter is intentionally conservative: AAU listings are not shown in the normal dropdown unless a provider can fetch public registered teams. Exposure listings can also be disabled by the platform; when that happens the app logs the provider result and keeps using recent valid cached tournament data.
 
 ## Local Setup
 
@@ -71,6 +107,7 @@ Open `http://localhost:3000`.
 - `GET /api/alerts?eventId=255539`
 - `POST /api/admin/sync-now` syncs all configured tournaments
 - `POST /api/admin/sync-now?eventId=255539` syncs one tournament
+- `POST /api/admin/discover-tournaments` runs public tournament discovery for the dropdown
 
 ## Checks
 

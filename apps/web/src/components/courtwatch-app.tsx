@@ -147,7 +147,8 @@ export function CourtWatchApp() {
   };
 
   const dashboard = dashboardQuery.data;
-  const isLoading = !presenceClientId || eventsQuery.isLoading || !activeEventId || dashboardQuery.isLoading;
+  const hasNoEvents = !eventsQuery.isLoading && (eventsQuery.data?.length ?? 0) === 0;
+  const isLoading = !presenceClientId || eventsQuery.isLoading || (!hasNoEvents && (!activeEventId || dashboardQuery.isLoading));
   const offline = dashboardQuery.isError || gamesQuery.isError || alertsQuery.isError;
 
   return (
@@ -177,6 +178,7 @@ export function CourtWatchApp() {
 
         <section className="mt-4 flex-1">
           {isLoading ? <SkeletonDashboard /> : null}
+          {!isLoading && hasNoEvents ? <NoTournamentEvents /> : null}
           {!isLoading && dashboard && activeTab === "dashboard" ? (
             <DashboardScreen dashboard={dashboard} alerts={alertsQuery.data ?? dashboard.alerts} games={gamesQuery.data ?? []} onRefresh={refresh} eventId={activeEventId} />
           ) : null}
@@ -253,6 +255,9 @@ function AppHeader({
   onSelectEvent: (eventId: number) => void;
 }) {
   const selectedEvent = events.find((event) => event.exposureEventId === selectedEventId) ?? dashboard?.event;
+  const trackedEvents = events.filter((event) => event.dropdownGroup === "tracked");
+  const discoveredEvents = events.filter((event) => event.dropdownGroup !== "tracked");
+  const hasGroupedEvents = trackedEvents.length > 0 && discoveredEvents.length > 0;
   return (
     <header className="sticky top-0 z-30 -mx-4 border-b border-white/10 bg-[#07111f]/92 px-4 pb-3 pt-3 backdrop-blur">
       <div className="mb-3 flex justify-center">
@@ -297,12 +302,25 @@ function AppHeader({
           value={selectedEventId ?? ""}
           onChange={(event) => onSelectEvent(Number(event.target.value))}
           className="h-11 w-full rounded-lg border border-white/12 bg-slate-950 px-3 text-sm font-black text-white"
+          disabled={events.length === 0}
         >
-          {events.map((event) => (
-            <option key={event.exposureEventId} value={event.exposureEventId}>
-              {event.name}
-            </option>
-          ))}
+          {events.length === 0 ? <option value="">No upcoming tournaments with public registered teams found</option> : null}
+          {hasGroupedEvents ? (
+            <>
+              <optgroup label="My tracked events">
+                {trackedEvents.map((event) => (
+                  <TournamentOption key={event.exposureEventId} event={event} />
+                ))}
+              </optgroup>
+              <optgroup label="Upcoming tournaments with registered teams">
+                {discoveredEvents.map((event) => (
+                  <TournamentOption key={event.exposureEventId} event={event} />
+                ))}
+              </optgroup>
+            </>
+          ) : (
+            events.map((event) => <TournamentOption key={event.exposureEventId} event={event} />)
+          )}
         </select>
       </label>
       <div className="mt-3 flex items-center justify-between gap-3 text-xs text-slate-300">
@@ -314,6 +332,24 @@ function AppHeader({
       </div>
     </header>
   );
+}
+
+function TournamentOption({ event }: { event: TournamentEvent }) {
+  return <option value={event.exposureEventId}>{tournamentOptionLabel(event)}</option>;
+}
+
+function tournamentOptionLabel(event: TournamentEvent): string {
+  const place = event.city && event.state ? `${event.city}, ${event.state}` : event.location;
+  const date = compactTournamentDate(event.startDate, event.timezone);
+  return `${event.name} — ${place} — ${date} — ${event.registeredTeamCount} teams`;
+}
+
+function compactTournamentDate(dateKey: string, timeZone = DEFAULT_TOURNAMENT_TIME_ZONE): string {
+  return new Intl.DateTimeFormat("en-US", {
+    day: "numeric",
+    month: "short",
+    timeZone
+  }).format(new Date(`${dateKey}T12:00:00.000Z`));
 }
 
 function DashboardScreen({
@@ -1277,6 +1313,18 @@ function SkeletonDashboard() {
         <div key={item} className="h-36 animate-pulse rounded-lg bg-white/12" />
       ))}
     </div>
+  );
+}
+
+function NoTournamentEvents() {
+  return (
+    <section className="rounded-lg bg-white p-5 text-slate-950 shadow-sm">
+      <p className="text-xs font-black uppercase tracking-[0.16em] text-orange-600">Tournament</p>
+      <h2 className="mt-2 text-xl font-black">No upcoming tournaments with public registered teams found in the next 30 days.</h2>
+      <p className="mt-2 text-sm font-semibold leading-6 text-slate-600">
+        CourtWatch only lists events after a public organizer or platform source exposes both tournament details and at least one registered team.
+      </p>
+    </section>
   );
 }
 
