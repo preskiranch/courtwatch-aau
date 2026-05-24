@@ -47,7 +47,11 @@ The worker calls `POST /api/admin/discover-tournaments` at least daily. Discover
 - the provider exposes a public registered-team list
 - the registered-team endpoint/page can be fetched publicly; if teams are not posted yet, the dropdown shows `teams not posted yet`
 
-Default sources are configured in `MAJOR_TOURNAMENT_SOURCES`:
+Default sources are configured in `MAJOR_TOURNAMENT_SOURCES`. The built-in providers are:
+
+- `exposure_events`: public Exposure Basketball organization pages and event URLs. Defaults include Jam On It, Grassroots 365, and Zero Gravity public sources.
+- `public_html`: non-Exposure public event pages. This is intentionally configuration-driven and only publishes an event after a reachable public team-list page is found.
+- `aau_event_finder`: conservative discovery placeholder. AAU listings are not shown unless public registered-team data can be fetched.
 
 ```bash
 MAJOR_TOURNAMENT_SOURCES='[
@@ -66,6 +70,41 @@ MAJOR_TOURNAMENT_SOURCES='[
     "timezone": "America/Los_Angeles"
   },
   {
+    "name": "Grassroots 365",
+    "provider": "exposure_events",
+    "enabled": true,
+    "url": "https://basketball.exposureevents.com/organizations/21530/grassroots-365",
+    "eventUrls": [
+      "https://basketball.exposureevents.com/252014/g365-memorial-day-challenge",
+      "https://basketball.exposureevents.com/252017/g365-kings-of-the-south",
+      "https://basketball.exposureevents.com/252018/g365-sactown-swish"
+    ],
+    "organizerName": "Grassroots 365",
+    "sanctioningTags": ["Grassroots 365", "Exposure Events"],
+    "timezone": "America/Los_Angeles"
+  },
+  {
+    "name": "Zero Gravity Basketball",
+    "provider": "exposure_events",
+    "enabled": true,
+    "url": "https://basketball.exposureevents.com/organizations/18316/zero-gravity-basketball",
+    "organizerName": "Zero Gravity Basketball",
+    "sanctioningTags": ["Zero Gravity", "Exposure Events"],
+    "timezone": "America/Los_Angeles"
+  },
+  {
+    "name": "Configured Public HTML Sources",
+    "provider": "public_html",
+    "enabled": true,
+    "eventUrls": [],
+    "eventLinkPatterns": ["tournament|event"],
+    "teamListLinkPatterns": ["registered\\\\s+teams?|participating\\\\s+teams?|teams?"],
+    "teamSelectors": ["[data-team-name]"],
+    "organizerName": "Public Tournament Source",
+    "sanctioningTags": ["Public Source"],
+    "timezone": "America/Los_Angeles"
+  },
+  {
     "name": "AAU Event Finder",
     "provider": "aau_event_finder",
     "enabled": true,
@@ -76,6 +115,8 @@ MAJOR_TOURNAMENT_SOURCES='[
 ```
 
 The AAU adapter is intentionally conservative: AAU listings are not shown in the normal dropdown unless a provider can fetch a public registered-team endpoint or page. Exposure listings can also be disabled by the platform; when that happens the app logs the provider result and keeps using recent valid cached tournament data. Add known public Exposure tournament URLs to `eventUrls` when an organizer page does not list events publicly.
+
+For non-Exposure sources, use `public_html` with either `eventUrls` or a public index `url` plus `eventLinkPatterns`. The provider checks `robots.txt` by default and refuses blocked paths. It will not publish events that require login, CAPTCHA, payment, private APIs, or hidden team data.
 
 ## Local Setup
 

@@ -135,10 +135,16 @@ const TournamentSourceSchema = z
 
 const MajorTournamentSourceSchema = z.object({
   name: z.string().trim().min(1),
-  provider: z.enum(["exposure_events", "aau_event_finder"]),
+  provider: z.enum(["exposure_events", "public_html", "aau_event_finder"]),
   enabled: z.coerce.boolean().default(true),
   url: z.string().trim().url().optional(),
   eventUrls: z.array(z.string().trim().url()).optional(),
+  eventLinkPatterns: z.array(z.string().trim()).optional(),
+  teamListUrlTemplates: z.array(z.string().trim()).optional(),
+  teamListLinkPatterns: z.array(z.string().trim()).optional(),
+  teamSelectors: z.array(z.string().trim()).optional(),
+  maxEvents: z.coerce.number().optional(),
+  maxTeamListPages: z.coerce.number().optional(),
   organizerName: z.string().trim().optional(),
   sanctioningTags: z.array(z.string().trim()).optional(),
   timezone: z.string().trim().optional(),

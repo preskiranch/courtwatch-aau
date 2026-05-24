@@ -586,7 +586,7 @@ export class PrismaStore implements CourtWatchStore {
 
   private async syncTournament(tournament: TournamentSource, preloadedTeams?: PublicTournamentCandidate["teams"]) {
     const startedAt = new Date();
-    const source = isExposureConfigured() ? "exposure_api" : "public_page";
+    const source = tournament.externalProvider === "exposure_events" && isExposureConfigured() ? "exposure_api" : "public_page";
     let teamsCount = 0;
     let gamesCount = 0;
     let changesDetected = 0;
@@ -972,6 +972,7 @@ function clientHash(clientId: string): string {
 }
 
 async function fetchSourceTeams(tournament: TournamentSource): Promise<{ divisions: Division[]; teams: Team[] }> {
+  if (tournament.externalProvider !== "exposure_events") return { divisions: [], teams: [] };
   if (isExposureConfigured()) {
     try {
       const teams = await new ExposureClient().fetchTeams(tournament.exposureEventId);
@@ -1016,6 +1017,7 @@ async function fetchSourceTeams(tournament: TournamentSource): Promise<{ divisio
 }
 
 async function fetchSourceGames(selectedDivisionIds: string[], tournament: TournamentSource): Promise<Array<Record<string, unknown> | Game>> {
+  if (tournament.externalProvider !== "exposure_events") return [];
   try {
     if (isExposureConfigured()) {
       const exposureGames = await new ExposureClient().fetchGames(tournament.exposureEventId);
@@ -1032,6 +1034,7 @@ async function fetchSourceGames(selectedDivisionIds: string[], tournament: Tourn
 }
 
 async function fetchSourcePlayers(eventId: string, teamMap: Map<string, Team>, tournament: TournamentSource): Promise<Player[]> {
+  if (tournament.externalProvider !== "exposure_events") return [];
   if (!isExposureConfigured()) return [];
   try {
     const players = await new ExposureClient().fetchPlayers(tournament.exposureEventId);
