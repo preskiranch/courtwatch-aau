@@ -1,0 +1,1570 @@
+import { Prisma, type PrismaClient } from "@courtwatch/db";
+import {
+  DashboardService,
+  ExposureClient,
+  LEGACY_AUTO_PROGRAM_IDS,
+  PublicExposurePageClient,
+  RENO_TIMEZONE,
+  ScheduleService,
+  SELECTED_TEAMS_PROGRAM_ID,
+  SELECTED_TEAMS_PROGRAM_NAME,
+  buildDashboard,
+  buildDivisionResultGroups,
+  detectGameChanges,
+  deriveDivisionResultsFromGames,
+  extractDivisionMeta,
+  hashSource,
+  normalizeName,
+  normalizeProgramName,
+  watchedAlertEvents,
+  seedAliases,
+  seedChangeEvents,
+  seedDivisions,
+  seedGames,
+  seedPrograms,
+  seedSnapshot,
+  seedTeams
+} from "@courtwatch/core";
+import type {
+  CourtWatchSnapshot,
+  Division,
+  DivisionResult,
+  DivisionResultGroup,
+  Game,
+  GameChangeEvent,
+  MatchType,
+  Player,
+  ProgramAlias,
+  ProgramTeamMatch,
+  ProgramWatchlist,
+  ResultMedalLabel,
+  ResultPlacement,
+  ResultSource,
+  Team,
+  TournamentEvent
+} from "@courtwatch/core";
+import { fromZonedTime } from "date-fns-tz";
+import { createHash } from "node:crypto";
+import { configuredTournaments, isExposureConfigured, tournamentForExposureEventId } from "./config.js";
+import type { TournamentSource } from "./config.js";
+
+const teamSortCollator = new Intl.Collator("en-US", { numeric: true, sensitivity: "base" });
+
+export interface CourtWatchStore {
+  events(): Promise<TournamentEvent[]>;
+  snapshot(exposureEventId?: number | null): Promise<CourtWatchSnapshot>;
+  dashboard(clientId?: string | null, exposureEventId?: number | null): Promise<ReturnType<typeof buildDashboard>>;
+  program(programId: string, clientId?: string | null, exposureEventId?: number | null): Promise<ReturnType<DashboardService["build"]>["programs"][number] | null>;
+  games(filters: Record<string, string | undefined>, clientId?: string | null, exposureEventId?: number | null): Promise<Game[]>;
+  game(gameId: string): Promise<(Game & { changeHistory: GameChangeEvent[] }) | null>;
+  teams(search?: string, clientId?: string | null, exposureEventId?: number | null): Promise<Team[]>;
+  team(teamId: string): Promise<Team | null>;
+  results(clientId?: string | null, scope?: "watched" | "all", exposureEventId?: number | null): Promise<DivisionResultGroup[]>;
+  alerts(clientId?: string | null, exposureEventId?: number | null): Promise<GameChangeEvent[]>;
+  followTeam(teamId: string, clientId?: string | null): Promise<ProgramTeamMatch>;
+  unfollowTeam(teamId: string, clientId?: string | null): Promise<void>;
+  addAlias(programId: string, alias: string): Promise<ProgramAlias>;
+  deleteAlias(programId: string, aliasId: string): Promise<void>;
+  syncNow(exposureEventId?: number | null): Promise<{ status: string; source: string; teamsCount: number; gamesCount: number; changesDetected: number }>;
+}
+
+export class MockStore implements CourtWatchStore {
+  private data: CourtWatchSnapshot;
+
+  constructor(initialData: CourtWatchSnapshot = seedSnapshot) {
+    this.data = structuredClone(initialData);
+  }
+
+  async events(): Promise<TournamentEvent[]> {
+    const teamEventIds = new Set(this.data.teams.map((team) => team.eventId));
+    const eventsWithTeams = this.data.events.filter((event) => teamEventIds.has(event.id));
+    return structuredClone(sortTournamentEvents(eventsWithTeams.length > 0 ? eventsWithTeams : this.data.events));
+  }
+
+  async snapshot(exposureEventId?: number | null): Promise<CourtWatchSnapshot> {
+    return snapshotForTournament(structuredClone(this.data), exposureEventId);
+  }
+
+  async dashboard(clientId?: string | null, exposureEventId?: number | null) {
+    return buildDashboard(this.snapshotForClient(clientId, exposureEventId));
+  }
+
+  async program(programId: string, clientId?: string | null, exposureEventId?: number | null) {
+    return (await this.dashboard(clientId, exposureEventId)).programs.find((program) => program.program.id === programId) ?? null;
+  }
+
+  async games(filters: Record<string, string | undefined>, clientId?: string | null, exposureEventId?: number | null) {
+    const schedule = new ScheduleService().listWatchedGames(this.snapshotForClient(clientId, exposureEventId), {
+      programId: filters.programId,
+      status: filters.status,
+      court: filters.court,
+      division: filters.division,
+      scope: filters.scope
+    });
+    return schedule;
+  }
+
+  async game(gameId: string) {
+    const snapshot = structuredClone(this.data);
+    const game = snapshot.games.find((item) => item.id === gameId);
+    return game ? { ...game, changeHistory: snapshot.changeEvents.filter((event) => event.gameId === gameId) } : null;
+  }
+
+  async teams(search?: string, clientId?: string | null, exposureEventId?: number | null) {
+    const normalized = normalizeName(search);
+    const snapshot = this.snapshotForClient(clientId, exposureEventId);
+    return filterTeamsForSearch(snapshot, normalized);
+  }
+
+  async team(teamId: string) {
+    return this.data.teams.find((team) => team.id === teamId) ?? null;
+  }
+
+  async alerts(clientId?: string | null, exposureEventId?: number | null) {
+    const dashboard = await this.dashboard(clientId, exposureEventId);
+    return dashboard.alerts;
+  }
+
+  async results(clientId?: string | null, scope: "watched" | "all" = "watched", exposureEventId?: number | null) {
+    return buildDivisionResultGroups(this.snapshotForClient(clientId, exposureEventId), { scope });
+  }
+
+  async followTeam(teamId: string, clientId?: string | null) {
+    const team = this.data.teams.find((item) => item.id === teamId);
+    if (!team) throw new Error("Team not found");
+    const programId = this.ensureSelectedProgram(clientId).id;
+    const existing = this.data.matches.find((match) => match.programWatchlistId === programId && match.teamId === teamId);
+    if (existing) {
+      existing.active = true;
+      return structuredClone(existing);
+    }
+    const match: ProgramTeamMatch = {
+      id: `match-${programId}-${teamId}`,
+      programWatchlistId: programId,
+      teamId,
+      matchType: "manual",
+      matchConfidence: 1,
+      active: true,
+      createdAt: new Date().toISOString()
+    };
+    this.data.matches.push(match);
+    return structuredClone(match);
+  }
+
+  async unfollowTeam(teamId: string, clientId?: string | null) {
+    const programId = this.ensureSelectedProgram(clientId).id;
+    this.data.matches = this.data.matches.map((match) =>
+      match.programWatchlistId === programId && match.teamId === teamId ? { ...match, active: false } : match
+    );
+  }
+
+  async addAlias(programId: string, aliasValue: string) {
+    const alias: ProgramAlias = {
+      id: `alias-${Date.now()}`,
+      programWatchlistId: programId,
+      alias: aliasValue,
+      normalizedAlias: normalizeProgramName(aliasValue),
+      createdAt: new Date().toISOString()
+    };
+    this.data.aliases.push(alias);
+    await this.syncNow();
+    return alias;
+  }
+
+  async deleteAlias(programId: string, aliasId: string) {
+    this.data.aliases = this.data.aliases.filter((alias) => !(alias.programWatchlistId === programId && alias.id === aliasId));
+  }
+
+  async syncNow(exposureEventId?: number | null) {
+    const selectedEvents = exposureEventId ? this.data.events.filter((event) => event.exposureEventId === exposureEventId) : this.data.events;
+    const eventIds = selectedEvents.length > 0 ? selectedEvents.map((event) => event.id) : [this.data.event.id];
+    const teamsCount = this.data.teams.filter((team) => eventIds.includes(team.eventId)).length;
+    const gamesCount = this.data.games.filter((game) => eventIds.includes(game.eventId)).length;
+    const run = {
+      id: `sync-${Date.now()}`,
+      eventId: eventIds[0] ?? this.data.event.id,
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      status: "success" as const,
+      source: "mock" as const,
+      teamsCount,
+      gamesCount,
+      changesDetected: 0,
+      errorMessage: null
+    };
+    this.data.events = this.data.events.map((event) => (eventIds.includes(event.id) ? { ...event, lastSyncedAt: run.completedAt } : event));
+    this.data.event = this.data.events.find((event) => event.id === this.data.event.id) ?? this.data.event;
+    this.data.syncRuns.unshift(run);
+    return { status: run.status, source: run.source, teamsCount: run.teamsCount, gamesCount: run.gamesCount, changesDetected: run.changesDetected };
+  }
+
+  private snapshotForClient(clientId?: string | null, exposureEventId?: number | null): CourtWatchSnapshot {
+    const program = this.ensureSelectedProgram(clientId);
+    return scopeSnapshot(snapshotForTournament(structuredClone(this.data), exposureEventId), program.id);
+  }
+
+  private ensureSelectedProgram(clientId?: string | null): ProgramWatchlist {
+    const programId = selectedProgramIdForClient(clientId);
+    const existing = this.data.programs.find((program) => program.id === programId);
+    if (existing) return existing;
+    const program: ProgramWatchlist = {
+      id: programId,
+      userId: clientId ? selectedUserIdForClient(clientId) : null,
+      programName: SELECTED_TEAMS_PROGRAM_NAME,
+      normalizedProgramName: normalizeProgramName(SELECTED_TEAMS_PROGRAM_NAME),
+      active: true,
+      createdAt: new Date().toISOString()
+    };
+    this.data.programs.push(program);
+    return program;
+  }
+}
+
+export class PrismaStore implements CourtWatchStore {
+  constructor(private readonly prisma: PrismaClient) {}
+
+  async events(): Promise<TournamentEvent[]> {
+    const configured = configuredTournaments();
+    const configuredByExposureId = new Map(configured.map((event) => [event.exposureEventId, event]));
+    const [dbEvents, teamCounts] = await Promise.all([
+      this.prisma.event.findMany({ orderBy: [{ startDate: "asc" }, { name: "asc" }] }),
+      this.prisma.team.groupBy({ by: ["eventId"], _count: { _all: true } })
+    ]);
+    const merged = new Map<number, TournamentEvent>();
+
+    for (const event of configured) {
+      merged.set(event.exposureEventId, event);
+    }
+
+    for (const event of dbEvents) {
+      const source = configuredByExposureId.get(event.exposureEventId);
+      merged.set(event.exposureEventId, {
+        id: event.id,
+        exposureEventId: event.exposureEventId,
+        slug: source?.slug ?? slugFromOfficialUrl(event.officialUrl) ?? String(event.exposureEventId),
+        name: event.name,
+        organizer: event.organizer,
+        startDate: event.startDate.toISOString().slice(0, 10),
+        endDate: event.endDate.toISOString().slice(0, 10),
+        location: event.location,
+        officialUrl: event.officialUrl,
+        timezone: source?.timezone ?? RENO_TIMEZONE,
+        lastSyncedAt: event.lastSyncedAt?.toISOString() ?? null
+      });
+    }
+
+    const eventIdsWithTeams = new Set(teamCounts.filter((count) => count._count._all > 0).map((count) => count.eventId));
+    const allEvents = Array.from(merged.values());
+    const eventsWithTeams = allEvents.filter((event) => eventIdsWithTeams.has(event.id));
+    return sortTournamentEvents(eventsWithTeams.length > 0 ? eventsWithTeams : allEvents);
+  }
+
+  async snapshot(exposureEventId?: number | null): Promise<CourtWatchSnapshot> {
+    const tournament = tournamentForExposureEventId(exposureEventId);
+    const event = await this.prisma.event.findUnique({ where: { exposureEventId: tournament.exposureEventId } });
+    if (!event) return emptySnapshotForTournament(tournament, await this.events());
+
+    const [divisions, teams, players, divisionResults, programs, aliases, matches, games, changeEvents, syncRuns] = await Promise.all([
+      this.prisma.division.findMany({ where: { eventId: event.id } }),
+      this.prisma.team.findMany({ where: { eventId: event.id }, include: { division: true } }),
+      this.prisma.player.findMany({ where: { eventId: event.id } }),
+      this.prisma.divisionResult.findMany({ where: { eventId: event.id }, include: { division: true, team: true }, orderBy: [{ divisionId: "asc" }, { placement: "asc" }] }),
+      this.prisma.programWatchlist.findMany({ where: { active: true } }),
+      this.prisma.programAlias.findMany(),
+      this.prisma.programTeamMatch.findMany({ where: { active: true } }),
+      this.prisma.game.findMany({ where: { eventId: event.id }, orderBy: { startsAt: "asc" } }),
+      this.prisma.gameChangeEvent.findMany({ orderBy: { createdAt: "desc" }, take: 100 }),
+      this.prisma.syncRun.findMany({ where: { eventId: event.id }, orderBy: { startedAt: "desc" }, take: 20 })
+    ]);
+    const playerNamesByTeam = groupPlayerNamesByTeam(players.map(prismaPlayerToCore));
+    const followerCounts = teamFollowerCounts(programs, matches.map(prismaMatchToCore));
+    const followedTeamIds = new Set(matches.filter((match) => match.active && match.programWatchlistId === SELECTED_TEAMS_PROGRAM_ID).map((match) => match.teamId));
+
+    return {
+      event: {
+        id: event.id,
+        exposureEventId: event.exposureEventId,
+        slug: tournament.slug,
+        name: event.name,
+        organizer: event.organizer,
+        startDate: event.startDate.toISOString().slice(0, 10),
+        endDate: event.endDate.toISOString().slice(0, 10),
+        location: event.location,
+        officialUrl: event.officialUrl,
+        timezone: tournament.timezone,
+        lastSyncedAt: event.lastSyncedAt?.toISOString() ?? null
+      },
+      events: await this.events(),
+      divisions: divisions.map((division) => ({
+        id: division.id,
+        eventId: division.eventId,
+        exposureDivisionId: division.exposureDivisionId,
+        name: division.name,
+        gender: division.gender,
+        gradeLevel: division.gradeLevel,
+        level: division.level,
+        rawJson: division.rawJson
+      })),
+      teams: teams.map((team) => ({
+        id: team.id,
+        eventId: team.eventId,
+        divisionId: team.divisionId,
+        exposureTeamId: team.exposureTeamId,
+        name: team.name,
+        normalizedName: team.normalizedName,
+        clubName: team.clubName,
+        normalizedClubName: team.normalizedClubName,
+        coachName: team.coachName,
+        sourceUrl: team.sourceUrl,
+        divisionName: team.division?.name ?? null,
+        gender: team.division?.gender ?? null,
+        gradeLevel: team.division?.gradeLevel ?? null,
+        level: team.division?.level ?? null,
+        rawJson: team.rawJson,
+        lastSeenAt: team.lastSeenAt.toISOString(),
+        playerNames: playerNamesByTeam.get(team.id) ?? [],
+        isFollowed: followedTeamIds.has(team.id),
+        followerCount: followerCounts.get(team.id) ?? 0
+      })),
+      players: players.map(prismaPlayerToCore),
+      divisionResults: divisionResults.map((result) => ({
+        id: result.id,
+        eventId: result.eventId,
+        divisionId: result.divisionId,
+        divisionName: result.division.name,
+        gender: result.division.gender,
+        gradeLevel: result.division.gradeLevel,
+        level: result.division.level,
+        teamId: result.teamId,
+        teamNameSnapshot: result.teamNameSnapshot,
+        teamSourceUrl: result.team?.sourceUrl ?? null,
+        placement: result.placement as ResultPlacement,
+        medalLabel: result.medalLabel as ResultMedalLabel,
+        bracketLabel: result.bracketLabel,
+        source: result.source as ResultSource,
+        sourceUrl: result.sourceUrl,
+        isOfficial: result.isOfficial,
+        sourceHash: result.sourceHash,
+        rawJson: result.rawJson,
+        lastSeenAt: result.lastSeenAt.toISOString()
+      })),
+      programs: programs.map((program) => ({
+        id: program.id,
+        userId: program.userId,
+        programName: program.programName,
+        normalizedProgramName: program.normalizedProgramName,
+        active: program.active,
+        createdAt: program.createdAt.toISOString()
+      })),
+      aliases: aliases.map((alias) => ({
+        id: alias.id,
+        programWatchlistId: alias.programWatchlistId,
+        alias: alias.alias,
+        normalizedAlias: alias.normalizedAlias,
+        createdAt: alias.createdAt.toISOString()
+      })),
+      matches: matches.map((match) => ({
+        id: match.id,
+        programWatchlistId: match.programWatchlistId,
+        teamId: match.teamId,
+        matchType: match.matchType as MatchType,
+        matchConfidence: Number(match.matchConfidence),
+        active: match.active,
+        createdAt: match.createdAt.toISOString()
+      })),
+      games: games.map((game) => ({
+        id: game.id,
+        eventId: game.eventId,
+        divisionId: game.divisionId,
+        exposureGameId: game.exposureGameId,
+        gameNumber: game.gameNumber,
+        gameType: game.gameType,
+        scheduledDate: game.scheduledDate.toISOString().slice(0, 10),
+        scheduledTime: game.scheduledTime,
+        startsAt: game.startsAt.toISOString(),
+        timezone: game.timezone,
+        venueName: game.venueName,
+        courtName: game.courtName,
+        homeTeamId: game.homeTeamId,
+        awayTeamId: game.awayTeamId,
+        homeTeamNameSnapshot: game.homeTeamNameSnapshot,
+        awayTeamNameSnapshot: game.awayTeamNameSnapshot,
+        homeScore: game.homeScore,
+        awayScore: game.awayScore,
+        status: game.status as Game["status"],
+        officialUrl: game.officialUrl,
+        streamingUrl: game.streamingUrl,
+        updatedAt: game.updatedAt.toISOString(),
+        sourceHash: game.sourceHash,
+        rawJson: game.rawJson
+      })),
+      changeEvents: changeEvents.map(toCoreChange),
+      syncRuns: syncRuns.map((run) => ({
+        id: run.id,
+        eventId: run.eventId,
+        startedAt: run.startedAt.toISOString(),
+        completedAt: run.completedAt?.toISOString() ?? null,
+        status: run.status as "success" | "failed" | "running",
+        source: run.source as "exposure_api" | "public_page" | "mock",
+        teamsCount: run.teamsCount,
+        gamesCount: run.gamesCount,
+        changesDetected: run.changesDetected,
+        errorMessage: run.errorMessage
+      }))
+    };
+  }
+
+  async dashboard(clientId?: string | null, exposureEventId?: number | null) {
+    return buildDashboard(await this.snapshotForClient(clientId, exposureEventId));
+  }
+
+  async program(programId: string, clientId?: string | null, exposureEventId?: number | null) {
+    return (await this.dashboard(clientId, exposureEventId)).programs.find((program) => program.program.id === programId) ?? null;
+  }
+
+  async games(filters: Record<string, string | undefined>, clientId?: string | null, exposureEventId?: number | null) {
+    return new ScheduleService().listWatchedGames(await this.snapshotForClient(clientId, exposureEventId), {
+      programId: filters.programId,
+      status: filters.status,
+      court: filters.court,
+      division: filters.division,
+      scope: filters.scope
+    });
+  }
+
+  async game(gameId: string) {
+    const game = await this.prisma.game.findUnique({ where: { id: gameId } });
+    if (!game) return null;
+    const changeEvents = await this.prisma.gameChangeEvent.findMany({ where: { gameId }, orderBy: { createdAt: "desc" } });
+    return { ...prismaGameToCore(game), changeHistory: changeEvents.map(toCoreChange) };
+  }
+
+  async teams(search?: string, clientId?: string | null, exposureEventId?: number | null) {
+    const snapshot = await this.snapshotForClient(clientId, exposureEventId);
+    const normalized = normalizeName(search);
+    return filterTeamsForSearch(snapshot, normalized);
+  }
+
+  async results(clientId?: string | null, scope: "watched" | "all" = "watched", exposureEventId?: number | null) {
+    return buildDivisionResultGroups(await this.snapshotForClient(clientId, exposureEventId), { scope });
+  }
+
+  async team(teamId: string) {
+    const team = await this.prisma.team.findUnique({ where: { id: teamId }, include: { division: true } });
+    if (!team) return null;
+    return {
+      id: team.id,
+      eventId: team.eventId,
+      divisionId: team.divisionId,
+      exposureTeamId: team.exposureTeamId,
+      name: team.name,
+      normalizedName: team.normalizedName,
+      clubName: team.clubName,
+      normalizedClubName: team.normalizedClubName,
+      coachName: team.coachName,
+      sourceUrl: team.sourceUrl,
+      divisionName: team.division?.name ?? null,
+      gender: team.division?.gender ?? null,
+      gradeLevel: team.division?.gradeLevel ?? null,
+      level: team.division?.level ?? null,
+      rawJson: team.rawJson,
+      lastSeenAt: team.lastSeenAt.toISOString()
+    };
+  }
+
+  async alerts(clientId?: string | null, exposureEventId?: number | null) {
+    const snapshot = await this.snapshotForClient(clientId, exposureEventId);
+    const activeProgramIds = new Set(snapshot.programs.map((program) => program.id));
+    const watchedTeamIds = new Set(snapshot.matches.filter((match) => match.active && activeProgramIds.has(match.programWatchlistId)).map((match) => match.teamId));
+    const watchedGameIds = new Set(
+      snapshot.games.filter((game) => watchedTeamIds.has(game.homeTeamId ?? "") || watchedTeamIds.has(game.awayTeamId ?? "")).map((game) => game.id)
+    );
+    return watchedAlertEvents(snapshot.changeEvents, watchedTeamIds, watchedGameIds, activeProgramIds).sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
+  }
+
+  async followTeam(teamId: string, clientId?: string | null) {
+    const program = await this.ensureSelectedProgram(clientId);
+    const team = await this.prisma.team.findUnique({ where: { id: teamId } });
+    if (!team) throw new Error("Team not found");
+    const match = await this.prisma.programTeamMatch.upsert({
+      where: { programWatchlistId_teamId: { programWatchlistId: program.id, teamId } },
+      update: { active: true, matchType: "manual", matchConfidence: 1 },
+      create: {
+        programWatchlistId: program.id,
+        teamId,
+        matchType: "manual",
+        matchConfidence: 1
+      }
+    });
+    await this.syncNow();
+    return prismaMatchToCore(match);
+  }
+
+  async unfollowTeam(teamId: string, clientId?: string | null) {
+    const program = await this.ensureSelectedProgram(clientId);
+    await this.prisma.programTeamMatch.updateMany({
+      where: { programWatchlistId: program.id, teamId },
+      data: { active: false }
+    });
+  }
+
+  async addAlias(programId: string, aliasValue: string) {
+    const alias = await this.prisma.programAlias.upsert({
+      where: {
+        programWatchlistId_normalizedAlias: {
+          programWatchlistId: programId,
+          normalizedAlias: normalizeProgramName(aliasValue)
+        }
+      },
+      update: { alias: aliasValue },
+      create: {
+        programWatchlistId: programId,
+        alias: aliasValue,
+        normalizedAlias: normalizeProgramName(aliasValue)
+      }
+    });
+    await this.syncNow();
+    return {
+      id: alias.id,
+      programWatchlistId: alias.programWatchlistId,
+      alias: alias.alias,
+      normalizedAlias: alias.normalizedAlias,
+      createdAt: alias.createdAt.toISOString()
+    };
+  }
+
+  async deleteAlias(programId: string, aliasId: string) {
+    await this.prisma.programAlias.deleteMany({ where: { id: aliasId, programWatchlistId: programId } });
+    await this.syncNow();
+  }
+
+  async syncNow(exposureEventId?: number | null) {
+    const tournaments = exposureEventId ? [tournamentForExposureEventId(exposureEventId)] : configuredTournaments();
+    const results = [];
+    for (const tournament of tournaments) {
+      results.push(await this.syncTournament(tournament));
+    }
+    return aggregateSyncResults(results);
+  }
+
+  private async syncTournament(tournament: TournamentSource) {
+    const startedAt = new Date();
+    const source = isExposureConfigured() ? "exposure_api" : "public_page";
+    let teamsCount = 0;
+    let gamesCount = 0;
+    let changesDetected = 0;
+
+    const event = await upsertEvent(this.prisma, tournament);
+    const run = await this.prisma.syncRun.create({
+      data: { eventId: event.id, startedAt, status: "running", source, teamsCount: 0, gamesCount: 0, changesDetected: 0 }
+    });
+
+    try {
+      const sourceTeams = await fetchSourceTeams(tournament);
+      const mockDataEnabled = process.env.ENABLE_MOCK_DATA === "true";
+      const includeMockArsenal = process.env.ENABLE_MOCK_ARSENAL === "true";
+      await ensurePrograms(this.prisma);
+      if (mockDataEnabled && sourceTeams.teams.length === 0) {
+        await upsertSeedDivisionsTeamsAndGames(this.prisma, event.id, includeMockArsenal);
+      } else {
+        await removeSeedGameAndChangeData(this.prisma);
+        if (!includeMockArsenal) await removeMockArsenalSeedData(this.prisma);
+      }
+
+      for (const division of sourceTeams.divisions) {
+        await upsertDivision(this.prisma, event.id, division);
+      }
+      for (const team of sourceTeams.teams) {
+        await upsertTeam(this.prisma, event.id, team);
+      }
+
+      const teamMap = await loadTeamMap(this.prisma, event.id);
+      const sourcePlayers = await fetchSourcePlayers(event.id, teamMap, tournament);
+      for (const player of sourcePlayers) {
+        await upsertPlayer(this.prisma, event.id, player);
+      }
+
+      const selectedDivisionIds = await loadSelectedDivisionExposureIds(this.prisma, event.id);
+      const sourceGames = await fetchSourceGames(selectedDivisionIds, tournament);
+      for (const sourceGame of sourceGames) {
+        const mapped = isCoreGame(sourceGame) ? mapStoredSourceGame(sourceGame, event.id, teamMap) : mapExposureGame(sourceGame, event.id, teamMap, tournament);
+        if (!mapped) continue;
+        const existing = mapped.exposureGameId
+          ? await this.prisma.game.findUnique({ where: { eventId_exposureGameId: { eventId: event.id, exposureGameId: mapped.exposureGameId } } })
+          : null;
+        const previousGame = existing ? prismaGameToCore(existing) : null;
+        const changes = detectGameChanges(previousGame, mapped);
+        changesDetected += changes.length;
+        const savedGame = await upsertGame(this.prisma, mapped);
+        for (const change of changes) {
+          await this.prisma.gameChangeEvent.upsert({
+            where: { dedupeKey: change.dedupeKey },
+            update: {},
+            create: {
+              gameId: savedGame.id,
+              affectedTeamId: change.affectedTeamId,
+              affectedProgramWatchlistId: change.affectedProgramWatchlistId,
+              eventType: change.eventType,
+              previousValue: change.previousValue as object,
+              newValue: change.newValue as object,
+              dedupeKey: change.dedupeKey
+            }
+          });
+        }
+      }
+
+      const resultSnapshot = await this.snapshot(tournament.exposureEventId);
+      for (const result of deriveDivisionResultsFromGames(resultSnapshot)) {
+        await upsertDivisionResult(this.prisma, result);
+      }
+
+      const after = await this.snapshot(tournament.exposureEventId);
+      teamsCount = after.teams.length;
+      gamesCount = after.games.length;
+      await this.prisma.event.update({ where: { id: event.id }, data: { lastSyncedAt: new Date() } });
+      await this.prisma.syncRun.update({
+        where: { id: run.id },
+        data: {
+          status: "success",
+          completedAt: new Date(),
+          teamsCount,
+          gamesCount,
+          changesDetected
+        }
+      });
+
+      return { status: "success", source, teamsCount, gamesCount, changesDetected };
+    } catch (error) {
+      await this.prisma.syncRun.update({
+        where: { id: run.id },
+        data: {
+          status: "failed",
+          completedAt: new Date(),
+          teamsCount,
+          gamesCount,
+          changesDetected,
+          errorMessage: error instanceof Error ? error.message : "Unknown sync error"
+        }
+      });
+      throw error;
+    }
+  }
+
+  private async snapshotForClient(clientId?: string | null, exposureEventId?: number | null): Promise<CourtWatchSnapshot> {
+    const program = await this.ensureSelectedProgram(clientId);
+    return scopeSnapshot(await this.snapshot(exposureEventId), program.id);
+  }
+
+  private async ensureSelectedProgram(clientId?: string | null): Promise<ProgramWatchlist> {
+    if (!clientId) {
+      await ensurePrograms(this.prisma);
+      return {
+        id: SELECTED_TEAMS_PROGRAM_ID,
+        userId: null,
+        programName: SELECTED_TEAMS_PROGRAM_NAME,
+        normalizedProgramName: normalizeProgramName(SELECTED_TEAMS_PROGRAM_NAME),
+        active: true,
+        createdAt: new Date().toISOString()
+      };
+    }
+
+    const user = await ensureUserForClient(this.prisma, clientId);
+    const normalizedProgramName = normalizeProgramName(SELECTED_TEAMS_PROGRAM_NAME);
+    const selectedProgramWhere = { userId_normalizedProgramName: { userId: user.id, normalizedProgramName } };
+    let program;
+    try {
+      program = await this.prisma.programWatchlist.upsert({
+        where: selectedProgramWhere,
+        update: {
+          programName: SELECTED_TEAMS_PROGRAM_NAME,
+          active: true
+        },
+        create: {
+          userId: user.id,
+          programName: SELECTED_TEAMS_PROGRAM_NAME,
+          normalizedProgramName,
+          active: true
+        }
+      });
+    } catch (error) {
+      if (!isUniqueConstraintError(error)) throw error;
+      program = await this.prisma.programWatchlist.findUnique({ where: selectedProgramWhere });
+      if (!program) throw error;
+    }
+
+    return {
+      id: program.id,
+      userId: program.userId,
+      programName: program.programName,
+      normalizedProgramName: program.normalizedProgramName,
+      active: program.active,
+      createdAt: program.createdAt.toISOString()
+    };
+  }
+}
+
+function snapshotForTournament(snapshot: CourtWatchSnapshot, exposureEventId?: number | null): CourtWatchSnapshot {
+  const event = selectSnapshotEvent(snapshot, exposureEventId);
+  const teamIds = new Set(snapshot.teams.filter((team) => team.eventId === event.id).map((team) => team.id));
+  const gameIds = new Set(snapshot.games.filter((game) => game.eventId === event.id).map((game) => game.id));
+
+  return {
+    ...snapshot,
+    event,
+    divisions: snapshot.divisions.filter((division) => division.eventId === event.id),
+    teams: snapshot.teams.filter((team) => team.eventId === event.id),
+    players: snapshot.players.filter((player) => player.eventId === event.id),
+    divisionResults: snapshot.divisionResults.filter((result) => result.eventId === event.id),
+    matches: snapshot.matches.filter((match) => teamIds.has(match.teamId)),
+    games: snapshot.games.filter((game) => game.eventId === event.id),
+    changeEvents: snapshot.changeEvents.filter((change) => (change.gameId ? gameIds.has(change.gameId) : true) && (change.affectedTeamId ? teamIds.has(change.affectedTeamId) : true)),
+    syncRuns: snapshot.syncRuns.filter((run) => run.eventId === event.id)
+  };
+}
+
+function selectSnapshotEvent(snapshot: CourtWatchSnapshot, exposureEventId?: number | null): TournamentEvent {
+  if (exposureEventId) {
+    const selected = snapshot.events.find((event) => event.exposureEventId === exposureEventId);
+    if (selected) return selected;
+  }
+  return snapshot.events.find((event) => event.exposureEventId === snapshot.event.exposureEventId) ?? snapshot.event;
+}
+
+function emptySnapshotForTournament(tournament: TournamentSource, events: TournamentEvent[]): CourtWatchSnapshot {
+  const event = events.find((item) => item.exposureEventId === tournament.exposureEventId) ?? tournament;
+  return {
+    event,
+    events,
+    divisions: [],
+    teams: [],
+    players: [],
+    divisionResults: [],
+    programs: seedPrograms,
+    aliases: [],
+    matches: [],
+    games: [],
+    changeEvents: [],
+    syncRuns: []
+  };
+}
+
+function sortTournamentEvents(events: TournamentEvent[]): TournamentEvent[] {
+  return [...events].sort((left, right) => left.startDate.localeCompare(right.startDate) || left.name.localeCompare(right.name));
+}
+
+function aggregateSyncResults(results: Array<{ status: string; source: string; teamsCount: number; gamesCount: number; changesDetected: number }>) {
+  return {
+    status: results.every((result) => result.status === "success") ? "success" : "failed",
+    source: Array.from(new Set(results.map((result) => result.source))).join("+") || "mock",
+    teamsCount: results.reduce((count, result) => count + result.teamsCount, 0),
+    gamesCount: results.reduce((count, result) => count + result.gamesCount, 0),
+    changesDetected: results.reduce((count, result) => count + result.changesDetected, 0)
+  };
+}
+
+function slugFromOfficialUrl(officialUrl: string): string | null {
+  try {
+    const parts = new URL(officialUrl).pathname.split("/").filter(Boolean);
+    return parts[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function scopeSnapshot(snapshot: CourtWatchSnapshot, programId: string): CourtWatchSnapshot {
+  const followerCounts = teamFollowerCounts(snapshot.programs, snapshot.matches);
+  const selectedProgram =
+    snapshot.programs.find((program) => program.id === programId) ??
+    ({
+      id: programId,
+      userId: programId === SELECTED_TEAMS_PROGRAM_ID ? null : programId.replace(/^program-selected-/, "user-device-"),
+      programName: SELECTED_TEAMS_PROGRAM_NAME,
+      normalizedProgramName: normalizeProgramName(SELECTED_TEAMS_PROGRAM_NAME),
+      active: true,
+      createdAt: new Date().toISOString()
+    } satisfies ProgramWatchlist);
+  const activeProgram = { ...selectedProgram, active: true };
+  const matches = snapshot.matches.filter((match) => match.programWatchlistId === programId && match.active);
+  const followedTeamIds = new Set(matches.map((match) => match.teamId));
+
+  return {
+    ...snapshot,
+    programs: [activeProgram],
+    aliases: snapshot.aliases.filter((alias) => alias.programWatchlistId === programId),
+    matches,
+    teams: snapshot.teams.map((team) => ({ ...team, isFollowed: followedTeamIds.has(team.id), followerCount: followerCounts.get(team.id) ?? 0 }))
+  };
+}
+
+function selectedProgramIdForClient(clientId?: string | null): string {
+  return clientId ? `program-selected-${clientHash(clientId)}` : SELECTED_TEAMS_PROGRAM_ID;
+}
+
+function selectedUserIdForClient(clientId: string): string {
+  return `user-device-${clientHash(clientId)}`;
+}
+
+async function ensureUserForClient(prisma: PrismaClient, clientId: string) {
+  try {
+    return await prisma.user.upsert({
+      where: { clientId },
+      update: {},
+      create: {
+        clientId,
+        displayName: "CourtWatch Device",
+        timezone: RENO_TIMEZONE
+      }
+    });
+  } catch (error) {
+    if (!isUniqueConstraintError(error)) throw error;
+    const existing = await prisma.user.findUnique({ where: { clientId } });
+    if (existing) return existing;
+    throw error;
+  }
+}
+
+function isUniqueConstraintError(error: unknown) {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
+}
+
+function clientHash(clientId: string): string {
+  return createHash("sha256").update(clientId.trim()).digest("hex").slice(0, 32);
+}
+
+async function fetchSourceTeams(tournament: TournamentSource): Promise<{ divisions: Division[]; teams: Team[] }> {
+  if (isExposureConfigured()) {
+    try {
+      const teams = await new ExposureClient().fetchTeams(tournament.exposureEventId);
+      const divisions = new Map<string, Division>();
+      const mappedTeams = teams.map((team) => {
+        const divisionName = String(team.Division?.Name ?? "Unknown Division");
+        const divisionExposureId = String(team.Division?.Id ?? normalizeName(divisionName));
+        const divisionId = `division-${tournament.exposureEventId}-${divisionExposureId}`;
+        const meta = extractDivisionMeta(divisionName);
+        divisions.set(divisionId, {
+          id: divisionId,
+          eventId: tournament.id,
+          exposureDivisionId: divisionExposureId,
+          name: divisionName,
+          ...meta,
+          rawJson: team.Division ?? {}
+        });
+        return {
+          id: `team-${tournament.exposureEventId}-${team.Id}`,
+          eventId: tournament.id,
+          divisionId,
+          exposureTeamId: String(team.Id),
+          name: team.Name,
+          normalizedName: normalizeName(team.Name),
+          clubName: null,
+          normalizedClubName: null,
+          coachName: null,
+          sourceUrl: `${tournament.officialUrl}/teams`,
+          divisionName,
+          ...meta,
+          rawJson: team,
+          lastSeenAt: new Date().toISOString()
+        };
+      });
+      return { divisions: Array.from(divisions.values()), teams: mappedTeams };
+    } catch {
+      return new PublicExposurePageClient().fetchTeams(tournament.exposureEventId, tournament.slug, tournament.timezone);
+    }
+  }
+
+  return new PublicExposurePageClient().fetchTeams(tournament.exposureEventId, tournament.slug, tournament.timezone);
+}
+
+async function fetchSourceGames(selectedDivisionIds: string[], tournament: TournamentSource): Promise<Array<Record<string, unknown> | Game>> {
+  try {
+    if (isExposureConfigured()) {
+      const exposureGames = await new ExposureClient().fetchGames(tournament.exposureEventId);
+      if (exposureGames.length > 0) return exposureGames;
+    }
+  } catch {
+    // Fall through to the public schedule endpoint; old data stays visible if that fails.
+  }
+
+  const publicClient = new PublicExposurePageClient();
+  const fetchAllPublicGames = process.env.EXPOSURE_PUBLIC_FETCH_ALL_GAMES === "true";
+  if (!fetchAllPublicGames && selectedDivisionIds.length === 0) return [];
+  return publicClient.fetchGames(tournament.exposureEventId, { divisionIds: fetchAllPublicGames ? [] : selectedDivisionIds, eventSlug: tournament.slug, timezone: tournament.timezone });
+}
+
+async function fetchSourcePlayers(eventId: string, teamMap: Map<string, Team>, tournament: TournamentSource): Promise<Player[]> {
+  if (!isExposureConfigured()) return [];
+  try {
+    const players = await new ExposureClient().fetchPlayers(tournament.exposureEventId);
+    return players
+      .map((player) => mapExposurePlayer(player, eventId, teamMap, tournament))
+      .filter((player): player is Player => Boolean(player));
+  } catch {
+    return [];
+  }
+}
+
+async function upsertEvent(prisma: PrismaClient, tournament: TournamentSource) {
+  return prisma.event.upsert({
+    where: { exposureEventId: tournament.exposureEventId },
+    update: {
+      name: tournament.name,
+      organizer: tournament.organizer,
+      startDate: new Date(`${tournament.startDate}T00:00:00.000Z`),
+      endDate: new Date(`${tournament.endDate}T00:00:00.000Z`),
+      location: tournament.location,
+      officialUrl: tournament.officialUrl
+    },
+    create: {
+      id: tournament.id,
+      exposureEventId: tournament.exposureEventId,
+      name: tournament.name,
+      organizer: tournament.organizer,
+      startDate: new Date(`${tournament.startDate}T00:00:00.000Z`),
+      endDate: new Date(`${tournament.endDate}T00:00:00.000Z`),
+      location: tournament.location,
+      officialUrl: tournament.officialUrl,
+      lastSyncedAt: tournament.lastSyncedAt ? new Date(tournament.lastSyncedAt) : null
+    }
+  });
+}
+
+async function ensurePrograms(prisma: PrismaClient) {
+  await prisma.programWatchlist.updateMany({ where: { id: { in: LEGACY_AUTO_PROGRAM_IDS } }, data: { active: false } });
+  for (const program of seedPrograms) {
+    await prisma.programWatchlist.upsert({
+      where: { id: program.id },
+      update: {
+        programName: SELECTED_TEAMS_PROGRAM_NAME,
+        normalizedProgramName: normalizeProgramName(SELECTED_TEAMS_PROGRAM_NAME),
+        active: true
+      },
+      create: {
+        id: program.id,
+        userId: null,
+        programName: SELECTED_TEAMS_PROGRAM_NAME,
+        normalizedProgramName: normalizeProgramName(SELECTED_TEAMS_PROGRAM_NAME),
+        active: true,
+        createdAt: new Date(program.createdAt)
+      }
+    });
+  }
+  const seenAliases = new Set<string>();
+  for (const alias of seedAliases) {
+    const aliasKey = `${alias.programWatchlistId}:${alias.normalizedAlias}`;
+    if (seenAliases.has(aliasKey)) continue;
+    seenAliases.add(aliasKey);
+    await prisma.programAlias.upsert({
+      where: {
+        programWatchlistId_normalizedAlias: {
+          programWatchlistId: alias.programWatchlistId,
+          normalizedAlias: alias.normalizedAlias
+        }
+      },
+      update: {
+        alias: alias.alias
+      },
+      create: {
+        id: alias.id,
+        programWatchlistId: alias.programWatchlistId,
+        alias: alias.alias,
+        normalizedAlias: alias.normalizedAlias,
+        createdAt: new Date(alias.createdAt)
+      }
+    });
+  }
+}
+
+async function upsertSeedDivisionsTeamsAndGames(prisma: PrismaClient, eventId: string, includeMockArsenal = true) {
+  const allowedDivisions = seedDivisions.filter((division) => division.eventId === eventId && (includeMockArsenal || !division.id.includes("arsenal")));
+  const allowedDivisionIds = new Set(allowedDivisions.map((division) => division.id));
+  const allowedTeams = seedTeams.filter((team) => allowedDivisionIds.has(team.divisionId ?? "") && (includeMockArsenal || !team.id.includes("arsenal")));
+  const allowedTeamIds = new Set(allowedTeams.map((team) => team.id));
+  const allowedGames = seedGames.filter(
+    (game) => game.eventId === eventId && (game.homeTeamId ? allowedTeamIds.has(game.homeTeamId) : true) && (game.awayTeamId ? allowedTeamIds.has(game.awayTeamId) : true)
+  );
+  const allowedGameIds = new Set(allowedGames.map((game) => game.id));
+
+  for (const division of allowedDivisions) {
+    await upsertDivision(prisma, eventId, division);
+  }
+  for (const team of allowedTeams) {
+    await upsertTeam(prisma, eventId, team);
+  }
+  for (const game of allowedGames) {
+    await upsertGame(prisma, { ...game, eventId });
+  }
+  for (const change of seedChangeEvents.filter((event) => !event.gameId || allowedGameIds.has(event.gameId))) {
+    await prisma.gameChangeEvent.upsert({
+      where: { dedupeKey: change.dedupeKey },
+      update: {},
+      create: {
+        id: change.id,
+        gameId: change.gameId,
+        affectedTeamId: change.affectedTeamId,
+        affectedProgramWatchlistId: change.affectedProgramWatchlistId,
+        eventType: change.eventType,
+        previousValue: change.previousValue as object,
+        newValue: change.newValue as object,
+        createdAt: new Date(change.createdAt),
+        notificationSent: change.notificationSent,
+        dedupeKey: change.dedupeKey
+      }
+    });
+  }
+}
+
+async function removeMockArsenalSeedData(prisma: PrismaClient) {
+  const mockTeamIds = seedTeams.filter((team) => team.id.includes("arsenal")).map((team) => team.id);
+  const mockDivisionIds = seedDivisions.filter((division) => division.id.includes("arsenal")).map((division) => division.id);
+  const mockTeamIdSet = new Set(mockTeamIds);
+  const mockGameIds = seedGames
+    .filter((game) => (game.homeTeamId ? mockTeamIdSet.has(game.homeTeamId) : false) || (game.awayTeamId ? mockTeamIdSet.has(game.awayTeamId) : false))
+    .map((game) => game.id);
+
+  await prisma.programTeamMatch.deleteMany({ where: { teamId: { in: mockTeamIds } } });
+  await prisma.gameChangeEvent.deleteMany({
+    where: {
+      OR: [{ affectedTeamId: { in: mockTeamIds } }, { gameId: { in: mockGameIds } }]
+    }
+  });
+  await prisma.game.deleteMany({ where: { id: { in: mockGameIds } } });
+  await prisma.team.deleteMany({ where: { id: { in: mockTeamIds } } });
+  await prisma.division.deleteMany({ where: { id: { in: mockDivisionIds } } });
+}
+
+async function removeSeedGameAndChangeData(prisma: PrismaClient) {
+  const seedGameIds = seedGames.map((game) => game.id);
+  const seedExposureGameIds = seedGames.map((game) => game.exposureGameId ?? game.id);
+  const seedChangeIds = [...seedChangeEvents.map((event) => event.id), "change-splash-3-final"];
+  const seedChangeDedupeKeys = seedChangeEvents.map((event) => event.dedupeKey);
+
+  await prisma.gameChangeEvent.deleteMany({
+    where: {
+      OR: [
+        { affectedProgramWatchlistId: { in: LEGACY_AUTO_PROGRAM_IDS } },
+        { id: { in: seedChangeIds } },
+        { dedupeKey: { in: seedChangeDedupeKeys } },
+        { gameId: { in: seedGameIds } }
+      ]
+    }
+  });
+  await prisma.game.deleteMany({
+    where: {
+      OR: [{ id: { in: seedGameIds } }, { exposureGameId: { in: seedExposureGameIds } }]
+    }
+  });
+}
+
+async function upsertDivision(prisma: PrismaClient, eventId: string, division: Division) {
+  const exposureDivisionId = division.exposureDivisionId ?? division.id;
+  return prisma.division.upsert({
+    where: { eventId_exposureDivisionId: { eventId, exposureDivisionId } },
+    update: {
+      name: division.name,
+      gender: division.gender,
+      gradeLevel: division.gradeLevel,
+      level: division.level,
+      rawJson: (division.rawJson ?? {}) as object
+    },
+    create: {
+      id: division.id,
+      eventId,
+      exposureDivisionId,
+      name: division.name,
+      gender: division.gender,
+      gradeLevel: division.gradeLevel,
+      level: division.level,
+      rawJson: (division.rawJson ?? {}) as object
+    }
+  });
+}
+
+async function upsertTeam(prisma: PrismaClient, eventId: string, team: Team) {
+  return prisma.team.upsert({
+    where: { eventId_exposureTeamId: { eventId, exposureTeamId: team.exposureTeamId ?? team.id } },
+    update: {
+      divisionId: team.divisionId,
+      name: team.name,
+      normalizedName: normalizeName(team.name),
+      clubName: team.clubName,
+      normalizedClubName: team.clubName ? normalizeName(team.clubName) : null,
+      coachName: team.coachName,
+      sourceUrl: team.sourceUrl,
+      rawJson: (team.rawJson ?? {}) as object,
+      lastSeenAt: new Date()
+    },
+    create: {
+      id: team.id,
+      eventId,
+      divisionId: team.divisionId,
+      exposureTeamId: team.exposureTeamId ?? team.id,
+      name: team.name,
+      normalizedName: normalizeName(team.name),
+      clubName: team.clubName,
+      normalizedClubName: team.clubName ? normalizeName(team.clubName) : null,
+      coachName: team.coachName,
+      sourceUrl: team.sourceUrl,
+      rawJson: (team.rawJson ?? {}) as object,
+      lastSeenAt: new Date(team.lastSeenAt)
+    }
+  });
+}
+
+async function upsertPlayer(prisma: PrismaClient, eventId: string, player: Player) {
+  const exposurePlayerId = player.exposurePlayerId ?? player.id;
+  return prisma.player.upsert({
+    where: { eventId_exposurePlayerId: { eventId, exposurePlayerId } },
+    update: {
+      teamId: player.teamId,
+      firstName: player.firstName,
+      lastName: player.lastName,
+      fullName: player.fullName,
+      normalizedName: normalizeName(player.fullName),
+      jerseyNumber: player.jerseyNumber,
+      position: player.position,
+      grade: player.grade,
+      rawJson: (player.rawJson ?? {}) as object,
+      lastSeenAt: new Date()
+    },
+    create: {
+      id: player.id,
+      eventId,
+      teamId: player.teamId,
+      exposurePlayerId,
+      firstName: player.firstName,
+      lastName: player.lastName,
+      fullName: player.fullName,
+      normalizedName: normalizeName(player.fullName),
+      jerseyNumber: player.jerseyNumber,
+      position: player.position,
+      grade: player.grade,
+      rawJson: (player.rawJson ?? {}) as object,
+      lastSeenAt: new Date(player.lastSeenAt)
+    }
+  });
+}
+
+async function upsertGame(prisma: PrismaClient, game: Game) {
+  return prisma.game.upsert({
+    where: { eventId_exposureGameId: { eventId: game.eventId, exposureGameId: game.exposureGameId ?? game.id } },
+    update: gameWrite(game),
+    create: {
+      id: game.id,
+      eventId: game.eventId,
+      exposureGameId: game.exposureGameId ?? game.id,
+      ...gameWrite(game)
+    }
+  });
+}
+
+function gameWrite(game: Game) {
+  return {
+    divisionId: game.divisionId,
+    gameNumber: game.gameNumber,
+    gameType: game.gameType,
+    scheduledDate: new Date(`${game.scheduledDate}T00:00:00.000Z`),
+    scheduledTime: game.scheduledTime,
+    startsAt: new Date(game.startsAt),
+    timezone: game.timezone,
+    venueName: game.venueName,
+    courtName: game.courtName,
+    homeTeamId: game.homeTeamId,
+    awayTeamId: game.awayTeamId,
+    homeTeamNameSnapshot: game.homeTeamNameSnapshot,
+    awayTeamNameSnapshot: game.awayTeamNameSnapshot,
+    homeScore: game.homeScore,
+    awayScore: game.awayScore,
+    status: game.status,
+    officialUrl: game.officialUrl,
+    streamingUrl: game.streamingUrl,
+    sourceHash: game.sourceHash,
+    rawJson: (game.rawJson ?? {}) as object
+  };
+}
+
+async function upsertDivisionResult(prisma: PrismaClient, result: DivisionResult) {
+  return prisma.divisionResult.upsert({
+    where: { eventId_divisionId_placement: { eventId: result.eventId, divisionId: result.divisionId, placement: result.placement } },
+    update: {
+      teamId: result.teamId,
+      teamNameSnapshot: result.teamNameSnapshot,
+      medalLabel: result.medalLabel,
+      bracketLabel: result.bracketLabel,
+      source: result.source,
+      sourceUrl: result.sourceUrl,
+      isOfficial: result.isOfficial,
+      sourceHash: result.sourceHash,
+      rawJson: (result.rawJson ?? {}) as object,
+      lastSeenAt: new Date(result.lastSeenAt)
+    },
+    create: {
+      id: result.id,
+      eventId: result.eventId,
+      divisionId: result.divisionId,
+      teamId: result.teamId,
+      placement: result.placement,
+      medalLabel: result.medalLabel,
+      bracketLabel: result.bracketLabel,
+      teamNameSnapshot: result.teamNameSnapshot,
+      source: result.source,
+      sourceUrl: result.sourceUrl,
+      isOfficial: result.isOfficial,
+      sourceHash: result.sourceHash,
+      rawJson: (result.rawJson ?? {}) as object,
+      lastSeenAt: new Date(result.lastSeenAt)
+    }
+  });
+}
+
+async function loadTeamMap(prisma: PrismaClient, eventId: string): Promise<Map<string, Team>> {
+  const teams = await prisma.team.findMany({ where: { eventId }, include: { division: true } });
+  return new Map(
+    teams.flatMap((team) => {
+      const coreTeam: Team = {
+        id: team.id,
+        eventId: team.eventId,
+        divisionId: team.divisionId,
+        exposureTeamId: team.exposureTeamId,
+        name: team.name,
+        normalizedName: team.normalizedName,
+        clubName: team.clubName,
+        normalizedClubName: team.normalizedClubName,
+        coachName: team.coachName,
+        sourceUrl: team.sourceUrl,
+        divisionName: team.division?.name ?? null,
+        gender: team.division?.gender ?? null,
+        gradeLevel: team.division?.gradeLevel ?? null,
+        level: team.division?.level ?? null,
+        rawJson: team.rawJson,
+        lastSeenAt: team.lastSeenAt.toISOString()
+      };
+      return [
+        [team.id, coreTeam],
+        ...(team.exposureTeamId ? ([[team.exposureTeamId, coreTeam]] as Array<[string, Team]>) : [])
+      ] as Array<[string, Team]>;
+    })
+  );
+}
+
+async function loadSelectedDivisionExposureIds(prisma: PrismaClient, eventId: string): Promise<string[]> {
+  const followedTeams = await prisma.team.findMany({
+    where: {
+      eventId,
+      matches: {
+        some: {
+          active: true,
+          programWatchlist: {
+            active: true,
+            normalizedProgramName: normalizeProgramName(SELECTED_TEAMS_PROGRAM_NAME)
+          }
+        }
+      }
+    },
+    include: { division: true }
+  });
+  return Array.from(new Set(followedTeams.map((team) => team.division?.exposureDivisionId).filter((value): value is string => Boolean(value))));
+}
+
+function isCoreGame(value: unknown): value is Game {
+  return isRecord(value) && typeof value.id === "string" && typeof value.startsAt === "string" && typeof value.scheduledDate === "string";
+}
+
+function mapStoredSourceGame(game: Game, eventId: string, teamMap: Map<string, Team>): Game {
+  const raw = isRecord(game.rawJson) ? game.rawJson : {};
+  const homeDivisionTeamId = stringOrNull(raw.HomeDivisionTeamId);
+  const awayDivisionTeamId = stringOrNull(raw.AwayDivisionTeamId);
+  return {
+    ...game,
+    eventId,
+    homeTeamId: (homeDivisionTeamId ? teamMap.get(homeDivisionTeamId)?.id : null) ?? game.homeTeamId,
+    awayTeamId: (awayDivisionTeamId ? teamMap.get(awayDivisionTeamId)?.id : null) ?? game.awayTeamId
+  };
+}
+
+function mapExposureGame(raw: Record<string, unknown>, eventId: string, teamMap: Map<string, Team>, tournament: TournamentSource): Game | null {
+  const id = String(raw.Id ?? "");
+  if (!id) return null;
+  const division = raw.Division as { Id?: number | string; Name?: string } | undefined;
+  const venueCourt = raw.VenueCourt as { Court?: { Name?: string }; Venue?: { Name?: string } } | undefined;
+  const home = raw.HomeTeam as { TeamId?: number | string; Name?: string; Score?: number } | undefined;
+  const away = raw.AwayTeam as { TeamId?: number | string; Name?: string; Score?: number } | undefined;
+  const homeTeam = home?.TeamId ? teamMap.get(String(home.TeamId)) : null;
+  const awayTeam = away?.TeamId ? teamMap.get(String(away.TeamId)) : null;
+  const date = String(raw.Date ?? tournament.startDate);
+  const time = String(raw.Time ?? "12:00 PM");
+  const startsAt = parseTournamentDateTime(date, time, tournament.timezone);
+  const rawHash = hashSource(raw);
+
+  return {
+    id: `game-${tournament.exposureEventId}-${id}`,
+    eventId,
+    divisionId: division?.Id ? `division-${tournament.exposureEventId}-${division.Id}` : null,
+    exposureGameId: id,
+    gameNumber: raw.Number ? String(raw.Number) : null,
+    gameType: raw.BracketName ? `Bracket ${String(raw.BracketName)}` : raw.Type ? String(raw.Type) : null,
+    scheduledDate: toIsoDate(date),
+    scheduledTime: time,
+    startsAt: startsAt.toISOString(),
+    timezone: tournament.timezone,
+    venueName: venueCourt?.Venue?.Name ?? null,
+    courtName: venueCourt?.Court?.Name ?? null,
+    homeTeamId: homeTeam?.id ?? null,
+    awayTeamId: awayTeam?.id ?? null,
+    homeTeamNameSnapshot: homeTeam?.name ?? home?.Name ?? null,
+    awayTeamNameSnapshot: awayTeam?.name ?? away?.Name ?? null,
+    homeScore: typeof home?.Score === "number" ? home.Score : null,
+    awayScore: typeof away?.Score === "number" ? away.Score : null,
+    status: typeof home?.Score === "number" && typeof away?.Score === "number" ? "final" : "upcoming",
+    officialUrl: `${tournament.officialUrl}/schedule`,
+    streamingUrl: null,
+    updatedAt: new Date().toISOString(),
+    sourceHash: rawHash,
+    rawJson: raw
+  };
+}
+
+function mapExposurePlayer(raw: Record<string, unknown>, eventId: string, teamMap: Map<string, Team>, tournament: TournamentSource): Player | null {
+  const id = stringOrNull(raw.Id);
+  if (!id) return null;
+  const profile = isRecord(raw.Profile) ? raw.Profile : {};
+  const firstName = stringOrNull(raw.FirstName);
+  const lastName = stringOrNull(raw.LastName);
+  const fullName = stringOrNull(raw.Name) ?? [firstName, lastName].filter(Boolean).join(" ").trim();
+  if (!fullName) return null;
+  const team = extractExposureTeamIds(raw)
+    .map((teamId) => teamMap.get(teamId))
+    .find((item): item is Team => Boolean(item));
+
+  return {
+    id: `player-${tournament.exposureEventId}-${id}`,
+    eventId,
+    teamId: team?.id ?? null,
+    exposurePlayerId: id,
+    firstName,
+    lastName,
+    fullName,
+    normalizedName: normalizeName(fullName),
+    jerseyNumber: stringOrNull(raw.Number) ?? stringOrNull(raw.JerseyNumber),
+    position: stringOrNull(raw.Position) ?? stringOrNull(profile.Position),
+    grade: stringOrNull(raw.Grade) ?? stringOrNull(profile.Grade),
+    rawJson: raw,
+    lastSeenAt: new Date().toISOString()
+  };
+}
+
+function extractExposureTeamIds(raw: Record<string, unknown>): string[] {
+  const ids = new Set<string>();
+  for (const key of ["TeamId", "TeamID", "DivisionTeamId", "DivisionTeamID"]) {
+    const value = stringOrNull(raw[key]);
+    if (value) ids.add(value);
+  }
+  if (isRecord(raw.Team)) {
+    const value = stringOrNull(raw.Team.Id ?? raw.Team.TeamId);
+    if (value) ids.add(value);
+  }
+  if (Array.isArray(raw.Teams)) {
+    for (const team of raw.Teams) {
+      if (!isRecord(team)) continue;
+      const value = stringOrNull(team.Id ?? team.TeamId);
+      if (value) ids.add(value);
+    }
+  }
+  return Array.from(ids);
+}
+
+function filterTeamsForSearch(snapshot: CourtWatchSnapshot, normalizedSearch: string): Team[] {
+  const activeProgramIds = new Set(snapshot.programs.filter((program) => program.active).map((program) => program.id));
+  const followedTeamIds = new Set(snapshot.matches.filter((match) => match.active && activeProgramIds.has(match.programWatchlistId)).map((match) => match.teamId));
+  const followerCounts = teamFollowerCounts(snapshot.programs, snapshot.matches);
+
+  return snapshot.teams
+    .map((team) => ({
+      ...team,
+      isFollowed: followedTeamIds.has(team.id),
+      followerCount: team.followerCount ?? followerCounts.get(team.id) ?? 0
+    }))
+    .filter((team) => {
+      if (!normalizedSearch) return true;
+      return team.normalizedName.includes(normalizedSearch) || normalizeName(team.clubName).includes(normalizedSearch) || normalizeName(team.divisionName).includes(normalizedSearch);
+    })
+    .sort(compareRegisteredTeams);
+}
+
+function teamFollowerCounts(
+  programs: Array<Pick<ProgramWatchlist, "active" | "id" | "normalizedProgramName" | "userId">>,
+  matches: Array<Pick<ProgramTeamMatch, "active" | "programWatchlistId" | "teamId">>
+): Map<string, number> {
+  const countableProgramIds = new Set(
+    programs
+      .filter((program) => program.active && program.userId && program.normalizedProgramName === normalizeProgramName(SELECTED_TEAMS_PROGRAM_NAME))
+      .map((program) => program.id)
+  );
+  const programTeamPairs = new Set<string>();
+  for (const match of matches) {
+    if (!match.active || !countableProgramIds.has(match.programWatchlistId)) continue;
+    programTeamPairs.add(`${match.programWatchlistId}:${match.teamId}`);
+  }
+
+  const counts = new Map<string, number>();
+  for (const pair of programTeamPairs) {
+    const teamId = pair.split(":").slice(1).join(":");
+    counts.set(teamId, (counts.get(teamId) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function compareRegisteredTeams(left: Team, right: Team): number {
+  return (
+    teamSortCollator.compare(teamAlphaGroup(left), teamAlphaGroup(right)) ||
+    teamSortCollator.compare(left.name, right.name) ||
+    teamSortCollator.compare(left.divisionName ?? "", right.divisionName ?? "") ||
+    teamSortCollator.compare(left.id, right.id)
+  );
+}
+
+function teamAlphaGroup(team: Team): string {
+  return team.name.trim();
+}
+
+function groupPlayerNamesByTeam(players: Player[]): Map<string, string[]> {
+  const names = new Map<string, string[]>();
+  for (const player of players) {
+    if (!player.teamId) continue;
+    names.set(player.teamId, [...(names.get(player.teamId) ?? []), player.fullName]);
+  }
+  return names;
+}
+
+function stringOrNull(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function parseTournamentDateTime(date: string, time: string, timezone: string): Date {
+  const [month = "5", day = "23", year = "2026"] = date.split("/");
+  const match = time.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  let hour = Number(match?.[1] ?? 12);
+  const minute = Number(match?.[2] ?? 0);
+  const meridiem = (match?.[3] ?? "PM").toUpperCase();
+  if (meridiem === "PM" && hour < 12) hour += 12;
+  if (meridiem === "AM" && hour === 12) hour = 0;
+  const local = `${year.padStart(4, "0")}-${month.padStart(2, "0")}-${day.padStart(2, "0")}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00`;
+  return fromZonedTime(local, timezone);
+}
+
+function toIsoDate(date: string): string {
+  const [month = "5", day = "23", year = "2026"] = date.split("/");
+  return `${year.padStart(4, "0")}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
+}
+
+function prismaGameToCore(game: Awaited<ReturnType<PrismaClient["game"]["findFirst"]>> extends infer T ? NonNullable<T> : never): Game {
+  return {
+    id: game.id,
+    eventId: game.eventId,
+    divisionId: game.divisionId,
+    exposureGameId: game.exposureGameId,
+    gameNumber: game.gameNumber,
+    gameType: game.gameType,
+    scheduledDate: game.scheduledDate.toISOString().slice(0, 10),
+    scheduledTime: game.scheduledTime,
+    startsAt: game.startsAt.toISOString(),
+    timezone: game.timezone,
+    venueName: game.venueName,
+    courtName: game.courtName,
+    homeTeamId: game.homeTeamId,
+    awayTeamId: game.awayTeamId,
+    homeTeamNameSnapshot: game.homeTeamNameSnapshot,
+    awayTeamNameSnapshot: game.awayTeamNameSnapshot,
+    homeScore: game.homeScore,
+    awayScore: game.awayScore,
+    status: game.status as Game["status"],
+    officialUrl: game.officialUrl,
+    streamingUrl: game.streamingUrl,
+    updatedAt: game.updatedAt.toISOString(),
+    sourceHash: game.sourceHash,
+    rawJson: game.rawJson
+  };
+}
+
+function prismaPlayerToCore(player: {
+  id: string;
+  eventId: string;
+  teamId: string | null;
+  exposurePlayerId: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  fullName: string;
+  normalizedName: string;
+  jerseyNumber: string | null;
+  position: string | null;
+  grade: string | null;
+  rawJson: unknown;
+  lastSeenAt: Date;
+}): Player {
+  return {
+    id: player.id,
+    eventId: player.eventId,
+    teamId: player.teamId,
+    exposurePlayerId: player.exposurePlayerId,
+    firstName: player.firstName,
+    lastName: player.lastName,
+    fullName: player.fullName,
+    normalizedName: player.normalizedName,
+    jerseyNumber: player.jerseyNumber,
+    position: player.position,
+    grade: player.grade,
+    rawJson: player.rawJson,
+    lastSeenAt: player.lastSeenAt.toISOString()
+  };
+}
+
+function prismaMatchToCore(match: {
+  id: string;
+  programWatchlistId: string;
+  teamId: string;
+  matchType: string;
+  matchConfidence: unknown;
+  active: boolean;
+  createdAt: Date;
+}): ProgramTeamMatch {
+  return {
+    id: match.id,
+    programWatchlistId: match.programWatchlistId,
+    teamId: match.teamId,
+    matchType: match.matchType as MatchType,
+    matchConfidence: Number(match.matchConfidence),
+    active: match.active,
+    createdAt: match.createdAt.toISOString()
+  };
+}
+
+function toCoreChange(change: {
+  id: string;
+  gameId: string | null;
+  affectedTeamId: string | null;
+  affectedProgramWatchlistId: string | null;
+  eventType: string;
+  previousValue: unknown;
+  newValue: unknown;
+  createdAt: Date;
+  notificationSent: boolean;
+  dedupeKey: string;
+}): GameChangeEvent {
+  return {
+    id: change.id,
+    gameId: change.gameId,
+    affectedTeamId: change.affectedTeamId,
+    affectedProgramWatchlistId: change.affectedProgramWatchlistId,
+    eventType: change.eventType as GameChangeEvent["eventType"],
+    previousValue: change.previousValue,
+    newValue: change.newValue,
+    createdAt: change.createdAt.toISOString(),
+    notificationSent: change.notificationSent,
+    dedupeKey: change.dedupeKey
+  };
+}

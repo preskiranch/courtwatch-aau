@@ -1,0 +1,1581 @@
+"use client";
+
+import type { DashboardResponse, DivisionResult, DivisionResultGroup, Game, GameChangeEvent, ProgramSummary, Team, TournamentEvent } from "@courtwatch/core";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import clsx from "clsx";
+import {
+  Activity,
+  Bell,
+  CalendarDays,
+  CheckCircle2,
+  ChevronRight,
+  Clock3,
+  Gauge,
+  Home,
+  Instagram,
+  MapPin,
+  Medal,
+  Radio,
+  RefreshCcw,
+  Search,
+  Settings,
+  Share2,
+  ShieldAlert,
+  Smartphone,
+  Trophy,
+  Users,
+  WifiOff,
+  X
+} from "lucide-react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { CourtWatchApi, apiBaseUrl } from "../lib/api";
+import { stableClientId } from "../lib/client-id";
+import { DEFAULT_TOURNAMENT_TIME_ZONE, dateKeyInTimeZone, scheduleDateSectionLabel } from "../lib/date-labels";
+import { requestPushSubscription } from "../lib/push";
+
+type Tab = "dashboard" | "schedule" | "teams" | "alerts" | "settings";
+
+const tabs: Array<{ id: Tab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
+  { id: "dashboard", label: "Dashboard", icon: Home },
+  { id: "schedule", label: "Schedule", icon: CalendarDays },
+  { id: "teams", label: "Teams", icon: Users },
+  { id: "alerts", label: "Alerts", icon: Bell },
+  { id: "settings", label: "Settings", icon: Settings }
+];
+
+export function CourtWatchApp() {
+  const [activeTab, setActiveTab] = useState<Tab>("dashboard");
+  const [toast, setToast] = useState<string | null>(null);
+  const [presenceClientId, setPresenceClientId] = useState<string | null>(null);
+  const [selectedEventId, setSelectedEventId] = useState<number | null>(null);
+  const queryClient = useQueryClient();
+  const clientReady = Boolean(presenceClientId);
+  const eventsQuery = useQuery({ queryKey: ["events"], queryFn: CourtWatchApi.events, staleTime: 5 * 60_000 });
+  const activeEventId = selectedEventId ?? eventsQuery.data?.[0]?.exposureEventId ?? null;
+  const activeEvent = eventsQuery.data?.find((event) => event.exposureEventId === activeEventId) ?? null;
+  const todayKey = useTournamentTodayKey(activeEvent?.timezone ?? DEFAULT_TOURNAMENT_TIME_ZONE);
+  const lastTodayKeyRef = useRef(todayKey);
+  const dashboardQuery = useQuery({ queryKey: ["dashboard", presenceClientId, activeEventId], queryFn: () => CourtWatchApi.dashboard(activeEventId), enabled: clientReady && Boolean(activeEventId) });
+  const gamesQuery = useQuery({ queryKey: ["games", presenceClientId, activeEventId], queryFn: () => CourtWatchApi.games("", activeEventId), enabled: clientReady && Boolean(activeEventId) });
+  const alertsQuery = useQuery({ queryKey: ["alerts", presenceClientId, activeEventId], queryFn: () => CourtWatchApi.alerts(activeEventId), enabled: clientReady && Boolean(activeEventId) });
+  const presenceQuery = useQuery({
+    queryKey: ["presence", presenceClientId, activeTab],
+    queryFn: () => CourtWatchApi.presenceHeartbeat(presenceClientId ?? "unknown-client", activeTab),
+    enabled: clientReady,
+    refetchInterval: 25_000,
+    staleTime: 20_000
+  });
+
+  useEffect(() => {
+    setPresenceClientId(stableClientId());
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const saved = Number(window.localStorage.getItem("courtwatch-aau:selected-event-id"));
+    if (Number.isFinite(saved) && saved > 0) setSelectedEventId(saved);
+  }, []);
+
+  useEffect(() => {
+    if (!eventsQuery.data?.length) return;
+    setSelectedEventId((current) => {
+      if (current && eventsQuery.data.some((event) => event.exposureEventId === current)) return current;
+      return eventsQuery.data[0]?.exposureEventId ?? null;
+    });
+  }, [eventsQuery.data]);
+
+  const selectEvent = (eventId: number) => {
+    setSelectedEventId(eventId);
+    if (typeof window !== "undefined") window.localStorage.setItem("courtwatch-aau:selected-event-id", String(eventId));
+    setActiveTab("dashboard");
+  };
+
+  useEffect(() => {
+    if (lastTodayKeyRef.current === todayKey) return;
+    lastTodayKeyRef.current = todayKey;
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+      queryClient.invalidateQueries({ queryKey: ["games"] }),
+      queryClient.invalidateQueries({ queryKey: ["alerts"] }),
+      queryClient.invalidateQueries({ queryKey: ["results"] })
+    ]);
+  }, [queryClient, todayKey]);
+
+  useEffect(() => {
+    if (!presenceClientId || !dashboardQuery.data || typeof window === "undefined") return;
+    const migrationKey = `courtwatch:follow-migration:${presenceClientId}`;
+    if (window.localStorage.getItem(migrationKey)) return;
+    if (dashboardTeamIds(dashboardQuery.data).length > 0) {
+      window.localStorage.setItem(migrationKey, "complete");
+      return;
+    }
+    const teamIds = dashboardFollowMigrationTeamIds();
+    if (teamIds.length === 0) {
+      window.localStorage.setItem(migrationKey, "complete");
+      return;
+    }
+
+    let cancelled = false;
+    window.localStorage.setItem(migrationKey, "running");
+    void Promise.all(teamIds.map((teamId) => CourtWatchApi.followTeam(teamId)))
+      .then(() => {
+        if (cancelled) return;
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+        queryClient.invalidateQueries({ queryKey: ["games"] });
+        queryClient.invalidateQueries({ queryKey: ["alerts"] });
+        queryClient.invalidateQueries({ queryKey: ["teams"] });
+        window.localStorage.setItem(migrationKey, "complete");
+      })
+      .catch(() => {
+        window.localStorage.removeItem(migrationKey);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [dashboardQuery.data, presenceClientId, queryClient]);
+
+  const refresh = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+      queryClient.invalidateQueries({ queryKey: ["games"] }),
+      queryClient.invalidateQueries({ queryKey: ["alerts"] }),
+      queryClient.invalidateQueries({ queryKey: ["results"] })
+    ]);
+    setToast("Schedule refreshed");
+    window.setTimeout(() => setToast(null), 2200);
+  };
+
+  const dashboard = dashboardQuery.data;
+  const isLoading = !presenceClientId || eventsQuery.isLoading || !activeEventId || dashboardQuery.isLoading;
+  const offline = dashboardQuery.isError || gamesQuery.isError || alertsQuery.isError;
+
+  return (
+    <>
+      <ShareQrRail />
+      <main className="mx-auto flex min-h-dvh w-full max-w-[520px] flex-col px-4 pb-24 pt-4 text-white sm:max-w-3xl md:max-w-5xl">
+        <AppHeader
+          dashboard={dashboard}
+          events={eventsQuery.data ?? dashboard?.events ?? []}
+          selectedEventId={activeEventId}
+          offline={offline}
+          activeUsers={presenceQuery.data?.activeUsers ?? null}
+          onRefresh={refresh}
+          refreshing={dashboardQuery.isFetching || gamesQuery.isFetching}
+          onSelectEvent={selectEvent}
+        />
+
+        <div className="mt-4 xl:hidden">
+          <ShareQrMobileCard />
+        </div>
+
+        {toast ? (
+          <div className="fixed left-1/2 top-4 z-50 w-[calc(100%-2rem)] max-w-[420px] -translate-x-1/2 rounded-lg border border-orange-300/50 bg-orange-500 px-4 py-3 text-sm font-semibold text-white shadow-2xl">
+            {toast}
+          </div>
+        ) : null}
+
+        <section className="mt-4 flex-1">
+          {isLoading ? <SkeletonDashboard /> : null}
+          {!isLoading && dashboard && activeTab === "dashboard" ? (
+            <DashboardScreen dashboard={dashboard} alerts={alertsQuery.data ?? dashboard.alerts} games={gamesQuery.data ?? []} onRefresh={refresh} eventId={activeEventId} />
+          ) : null}
+          {!isLoading && dashboard && activeTab === "schedule" ? <ScheduleScreen games={gamesQuery.data ?? []} programs={dashboard.programs} todayKey={todayKey} timezone={dashboard.event.timezone} /> : null}
+          {!isLoading && dashboard && activeTab === "teams" ? <TeamsScreen dashboard={dashboard} eventId={activeEventId} /> : null}
+          {!isLoading && dashboard && activeTab === "alerts" ? <AlertsScreen alerts={alertsQuery.data ?? dashboard.alerts} games={gamesQuery.data ?? []} /> : null}
+          {!isLoading && dashboard && activeTab === "settings" ? <SettingsScreen dashboard={dashboard} onRefresh={refresh} eventId={activeEventId} /> : null}
+        </section>
+
+        <BottomTabs activeTab={activeTab} setActiveTab={setActiveTab} />
+      </main>
+    </>
+  );
+}
+
+function ShareQrRail() {
+  return (
+    <aside className="fixed left-3 top-32 z-20 hidden w-28 xl:block 2xl:left-6 2xl:w-36">
+      <ShareQrCard layout="rail" />
+    </aside>
+  );
+}
+
+function ShareQrMobileCard() {
+  return (
+    <div className="flex justify-start">
+      <ShareQrCard layout="mobile" />
+    </div>
+  );
+}
+
+function ShareQrCard({ layout }: { layout: "rail" | "mobile" }) {
+  const qrSize = layout === "rail" ? "h-24 w-24 2xl:h-32 2xl:w-32" : "h-20 w-20";
+  return (
+    <section
+      className={clsx(
+        "pointer-events-none rounded-lg border border-white/12 bg-[#07111f]/92 p-2 text-white shadow-2xl backdrop-blur",
+        layout === "rail" ? "text-center" : "flex max-w-[320px] items-center gap-3"
+      )}
+      aria-label="Share CourtWatch AAU"
+    >
+      <div className={clsx("grid shrink-0 place-items-center rounded-md border border-white/12 bg-slate-950 text-orange-300", qrSize)}>
+        <Share2 className="h-8 w-8" />
+      </div>
+      <div className={layout === "rail" ? "mt-2" : "min-w-0"}>
+        <div className={clsx("flex items-center gap-1 text-orange-300", layout === "rail" ? "justify-center" : "")}>
+          <Share2 className="h-3.5 w-3.5" />
+          <p className="text-[11px] font-black uppercase tracking-[0.12em]">Share</p>
+        </div>
+        <p className={clsx("font-black leading-tight", layout === "rail" ? "mt-1 text-sm" : "text-base")}>Share with your friends</p>
+        <p className="mt-1 text-[11px] font-semibold leading-4 text-slate-300">Open the same app link on another device.</p>
+      </div>
+    </section>
+  );
+}
+
+function AppHeader({
+  dashboard,
+  events,
+  selectedEventId,
+  offline,
+  activeUsers,
+  onRefresh,
+  refreshing,
+  onSelectEvent
+}: {
+  dashboard?: DashboardResponse;
+  events: TournamentEvent[];
+  selectedEventId: number | null;
+  offline: boolean;
+  activeUsers: number | null;
+  onRefresh: () => void;
+  refreshing: boolean;
+  onSelectEvent: (eventId: number) => void;
+}) {
+  const selectedEvent = events.find((event) => event.exposureEventId === selectedEventId) ?? dashboard?.event;
+  return (
+    <header className="sticky top-0 z-30 -mx-4 border-b border-white/10 bg-[#07111f]/92 px-4 pb-3 pt-3 backdrop-blur">
+      <div className="mb-3 flex justify-center">
+        <div className="inline-flex max-w-full items-center gap-2 rounded-lg border border-white/10 bg-white/8 px-3 py-1.5 text-[11px] font-bold text-slate-200">
+          <span className="whitespace-nowrap">Designed by PreskiRanch LLC</span>
+          <span className="h-3 w-px bg-white/20" />
+          <a href="https://www.instagram.com/PreskiRanch" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 whitespace-nowrap text-orange-300">
+            <Instagram className="h-3.5 w-3.5" />
+            @PreskiRanch
+          </a>
+        </div>
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-orange-300">
+            <Radio className="h-3.5 w-3.5" />
+            {selectedEvent?.organizer ?? "AAU Tournament"}
+          </div>
+          <h1 className="mt-1 text-2xl font-black tracking-normal text-white">CourtWatch AAU</h1>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="flex h-11 shrink-0 items-center gap-2 rounded-lg border border-white/12 bg-white/8 px-3 text-white" title="Active users online">
+            <Users className="h-4 w-4 text-emerald-300" />
+            <span className="text-left leading-none">
+              <span className="block text-sm font-black">{activeUsers ?? "-"}</span>
+              <span className="mt-0.5 block whitespace-nowrap text-[9px] font-black uppercase tracking-normal text-slate-300">Active users</span>
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={onRefresh}
+            className="grid h-11 w-11 place-items-center rounded-lg border border-white/12 bg-white/8 text-white transition active:scale-95"
+            aria-label="Refresh schedule"
+          >
+            <RefreshCcw className={clsx("h-5 w-5", refreshing && "animate-spin")} />
+          </button>
+        </div>
+      </div>
+      <label className="mt-3 block">
+        <span className="mb-1 block text-[11px] font-black uppercase tracking-[0.16em] text-slate-400">Tournament</span>
+        <select
+          value={selectedEventId ?? ""}
+          onChange={(event) => onSelectEvent(Number(event.target.value))}
+          className="h-11 w-full rounded-lg border border-white/12 bg-slate-950 px-3 text-sm font-black text-white"
+        >
+          {events.map((event) => (
+            <option key={event.exposureEventId} value={event.exposureEventId}>
+              {event.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <div className="mt-3 flex items-center justify-between gap-3 text-xs text-slate-300">
+        <span className="flex items-center gap-1.5">
+          {offline ? <WifiOff className="h-3.5 w-3.5 text-orange-300" /> : <CheckCircle2 className="h-3.5 w-3.5 text-emerald-300" />}
+          {offline ? "Offline cache" : dashboard?.sourceStatus.message ?? "Loading source"}
+        </span>
+        <span>{dashboard?.lastUpdated ? `Updated ${formatShortTime(dashboard.lastUpdated, dashboard.event.timezone)}` : "Sync pending"}</span>
+      </div>
+    </header>
+  );
+}
+
+function DashboardScreen({
+  dashboard,
+  alerts,
+  games,
+  onRefresh,
+  eventId
+}: {
+  dashboard: DashboardResponse;
+  alerts: GameChangeEvent[];
+  games: Game[];
+  onRefresh: () => void;
+  eventId: number | null;
+}) {
+  return (
+    <div className="space-y-4">
+      <NextGameBanner game={dashboard.nextGame} />
+
+      <button
+        type="button"
+        onClick={onRefresh}
+        className="flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-white/12 bg-white/8 px-4 text-sm font-semibold text-slate-100 active:scale-[0.99]"
+      >
+        <RefreshCcw className="h-4 w-4" />
+        Pull to refresh
+      </button>
+
+      <div className="grid gap-3 md:grid-cols-2">
+        {dashboard.programs.map((program) => (
+          <ProgramCard key={program.program.id} program={program} />
+        ))}
+      </div>
+
+      <FinalResultsSection eventId={eventId} />
+
+      <section className="court-card p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-lg font-black text-slate-950">Latest Alerts</h2>
+          <span className="text-xs font-bold text-slate-500">{alerts.length} updates</span>
+        </div>
+        <AlertList alerts={alerts.slice(0, 5)} games={games} compact />
+      </section>
+    </div>
+  );
+}
+
+function NextGameBanner({ game }: { game: Game | null }) {
+  if (!game) {
+    return (
+      <section className="court-card court-line-bg sticky top-[92px] z-20 overflow-hidden p-4">
+        <div className="flex items-center gap-3">
+          <div className="grid h-12 w-12 place-items-center rounded-lg bg-slate-950 text-orange-300">
+            <Trophy className="h-6 w-6" />
+          </div>
+          <div>
+            <p className="text-xs font-black uppercase tracking-[0.16em] text-orange-600">Next Game</p>
+            <h2 className="text-xl font-black text-slate-950">Choose teams to follow</h2>
+            <p className="text-sm font-medium text-slate-600">Search registered teams from the Teams tab.</p>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  const matchup = gameMatchupDisplayName(game);
+
+  return (
+    <section className="court-card court-line-bg sticky top-[92px] z-20 overflow-hidden p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="mb-2 inline-flex items-center gap-1.5 rounded-md bg-orange-500 px-2 py-1 text-[11px] font-black uppercase text-white">
+            <Clock3 className="h-3 w-3" />
+            NEXT
+          </div>
+          <h2 className="text-2xl font-black text-slate-950">{game.scheduledTime}</h2>
+          <p className="mt-1 text-sm font-bold text-slate-700">{matchup}</p>
+        </div>
+        <div className="rounded-lg bg-slate-950 px-3 py-2 text-right text-white">
+          <p className="text-[11px] font-bold uppercase text-orange-300">{game.courtName ?? "Court TBD"}</p>
+          <p className="max-w-28 text-xs text-slate-300">{game.venueName ?? "Venue TBD"}</p>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ProgramCard({ program }: { program: ProgramSummary }) {
+  const found = program.teams.length;
+  return (
+    <article className="court-card p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-xl font-black text-slate-950">
+            {program.program.programName} <span className="text-slate-400">&mdash;</span> {found} followed
+          </h2>
+          {program.zeroStateMessage ? <p className="mt-2 text-sm font-semibold text-amber-700">{program.zeroStateMessage}</p> : null}
+        </div>
+        <div className="grid h-10 w-10 place-items-center rounded-lg bg-orange-500 text-white">
+          <Users className="h-5 w-5" />
+        </div>
+      </div>
+
+      <div className="mt-4 grid grid-cols-2 gap-2">
+        <Metric label="Next" value={program.nextGame?.scheduledTime ?? "TBD"} />
+        <Metric label="Alerts" value={String(program.alertsCount)} />
+      </div>
+
+      <div className="mt-4 space-y-2">
+        {program.teams.slice(0, 4).map((team) => (
+          <div key={team.id} className="rounded-lg border border-slate-200 bg-white p-3">
+            <div className="flex items-center justify-between gap-2">
+              <p className="font-black text-slate-950">{teamDisplayName(team)}</p>
+              <StatusBadge status={team.liveStatus} />
+            </div>
+            <p className="mt-1 text-xs font-semibold text-slate-500">
+              {team.divisionName ?? "Division TBD"} {team.level ? ` / ${team.level}` : ""}
+            </p>
+            <p className="mt-2 text-sm text-slate-700">
+              {team.nextGame ? `${team.nextGame.scheduledTime} ${team.nextGame.courtName ?? "Court TBD"}` : "Next game awaiting bracket"}
+            </p>
+          </div>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function FinalResultsSection({ eventId }: { eventId: number | null }) {
+  const [scope, setScope] = useState<"watched" | "all">("watched");
+  const resultsQuery = useQuery({
+    queryKey: ["results", scope, eventId],
+    queryFn: () => CourtWatchApi.results(scope, eventId),
+    enabled: Boolean(eventId),
+    staleTime: 60_000
+  });
+  const resultGroups = resultsQuery.data ?? [];
+
+  return (
+    <section className="court-card p-4">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-black uppercase tracking-[0.16em] text-orange-600">Final Results</p>
+          <h2 className="mt-1 text-xl font-black text-slate-950">Gold, silver, bronze by division</h2>
+        </div>
+        <span className="shrink-0 rounded-md bg-orange-100 px-2 py-1 text-xs font-black text-orange-700">
+          {resultsQuery.isLoading ? "..." : `${resultGroups.length} divisions`}
+        </span>
+      </div>
+
+      <div className="mb-3 grid grid-cols-2 gap-2 rounded-lg bg-slate-100 p-1">
+        <button
+          type="button"
+          onClick={() => setScope("watched")}
+          className={clsx("min-h-10 rounded-md text-sm font-black transition active:scale-95", scope === "watched" ? "bg-slate-950 text-white" : "text-slate-600")}
+        >
+          My divisions
+        </button>
+        <button
+          type="button"
+          onClick={() => setScope("all")}
+          className={clsx("min-h-10 rounded-md text-sm font-black transition active:scale-95", scope === "all" ? "bg-slate-950 text-white" : "text-slate-600")}
+        >
+          All divisions
+        </button>
+      </div>
+
+      {resultsQuery.isLoading ? <div className="h-28 animate-pulse rounded-lg bg-slate-100" /> : null}
+      {!resultsQuery.isLoading && resultGroups.length === 0 ? (
+        <p className="rounded-lg bg-slate-100 p-3 text-sm font-semibold text-slate-600">Final placements will appear here after official bracket finals are posted.</p>
+      ) : null}
+
+      <div className="space-y-3">
+        {resultGroups.map((group) => (
+          <DivisionResultCard key={group.divisionId} group={group} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function DivisionResultCard({ group }: { group: DivisionResultGroup }) {
+  return (
+    <article className="rounded-lg border border-slate-200 bg-white p-3">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-base font-black leading-tight text-slate-950">{group.divisionName}</h3>
+          <p className="mt-1 text-xs font-semibold text-slate-500">
+            {group.gradeLevel ?? "Grade TBD"} {group.level ? `/ ${group.level}` : ""}
+          </p>
+        </div>
+        <span className={clsx("shrink-0 rounded-md px-2 py-1 text-[10px] font-black uppercase", group.isOfficial ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-600")}>
+          {group.isOfficial ? "Official" : "Bracket final"}
+        </span>
+      </div>
+
+      <div className="space-y-2">
+        {group.rows.map((result) => (
+          <DivisionResultRow key={`${result.divisionId}-${result.placement}`} result={result} />
+        ))}
+      </div>
+
+      <div className="mt-3 flex items-center justify-between gap-3 border-t border-slate-100 pt-3">
+        <p className="text-[11px] font-semibold leading-4 text-slate-500">Official schedules and rulings come from tournament staff.</p>
+        {group.sourceUrl ? (
+          <a href={group.sourceUrl} target="_blank" rel="noreferrer" className="shrink-0 text-xs font-black text-orange-600">
+            Source
+          </a>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+function DivisionResultRow({ result }: { result: DivisionResult }) {
+  const isChampion = result.placement === 1;
+  return (
+    <div className="flex items-center gap-3 rounded-lg bg-slate-50 p-2">
+      <div className={clsx("grid h-10 w-10 shrink-0 place-items-center rounded-lg text-white", result.placement === 1 ? "bg-orange-500" : result.placement === 2 ? "bg-slate-500" : "bg-amber-700")}>
+        {isChampion ? <Trophy className="h-5 w-5" /> : <Medal className="h-5 w-5" />}
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="text-[11px] font-black uppercase text-slate-500">{resultPlacementLabel(result)}</p>
+        <p className="truncate text-sm font-black text-slate-950">{result.teamNameSnapshot}</p>
+      </div>
+    </div>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+      <p className="text-[11px] font-black uppercase tracking-[0.14em] text-slate-400">{label}</p>
+      <p className="mt-0.5 text-lg font-black text-slate-950">{value}</p>
+    </div>
+  );
+}
+
+function ScheduleScreen({ games, programs, todayKey, timezone }: { games: Game[]; programs: ProgramSummary[]; todayKey: string; timezone: string }) {
+  const [programFilter, setProgramFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [courtFilter, setCourtFilter] = useState("");
+  const followedCount = programs.reduce((count, program) => count + program.teams.length, 0);
+  const watchedTeamsByProgram = useMemo(
+    () => new Map(programs.map((program) => [program.program.id, new Set(program.teams.map((team) => team.id))])),
+    [programs]
+  );
+  const courts = Array.from(new Set(games.map((game) => game.courtName).filter(Boolean))).sort();
+
+  const filteredGames = games.filter((game) => {
+    if (programFilter !== "all") {
+      const teamIds = watchedTeamsByProgram.get(programFilter);
+      if (!teamIds?.has(game.homeTeamId ?? "") && !teamIds?.has(game.awayTeamId ?? "")) return false;
+    }
+    if (statusFilter !== "all" && game.status !== statusFilter) return false;
+    if (courtFilter && game.courtName !== courtFilter) return false;
+    return true;
+  });
+
+  const groups = groupGamesByDate(filteredGames, todayKey, timezone);
+
+  return (
+    <div className="space-y-4">
+      <section className="rounded-lg border border-white/10 bg-white/8 p-3">
+        <div className="mb-3 flex items-center gap-2 text-sm font-black text-white">
+          <Search className="h-4 w-4 text-orange-300" />
+          Schedule Filters
+        </div>
+        <div className="no-scrollbar flex gap-2 overflow-x-auto pb-1">
+          <FilterButton active={programFilter === "all"} onClick={() => setProgramFilter("all")}>
+            All watched
+          </FilterButton>
+          {programs.map((program) => (
+            <FilterButton key={program.program.id} active={programFilter === program.program.id} onClick={() => setProgramFilter(program.program.id)}>
+              {program.program.programName}
+            </FilterButton>
+          ))}
+        </div>
+        <div className="mt-2 no-scrollbar flex gap-2 overflow-x-auto pb-1">
+          {["all", "playing_now", "upcoming", "final", "schedule_changed"].map((status) => (
+            <FilterButton key={status} active={statusFilter === status} onClick={() => setStatusFilter(status)}>
+              {status === "all" ? "All status" : labelStatus(status)}
+            </FilterButton>
+          ))}
+        </div>
+        <select
+          value={courtFilter}
+          onChange={(event) => setCourtFilter(event.target.value)}
+          className="mt-2 h-11 w-full rounded-lg border border-white/12 bg-slate-950 px-3 text-sm font-semibold text-white"
+        >
+          <option value="">All courts</option>
+          {courts.map((court) => (
+            <option key={court} value={court ?? ""}>
+              {court}
+            </option>
+          ))}
+        </select>
+      </section>
+
+      {groups.map((group) => (
+        <section key={group.date} className="space-y-2">
+          <h2 className="px-1 text-sm font-black uppercase tracking-[0.16em] text-orange-300">{group.label}</h2>
+          {group.games.map((game) => (
+            <GameRow key={game.id} game={game} />
+          ))}
+        </section>
+      ))}
+      {groups.length === 0 ? (
+        <section className="court-card p-4">
+          <h2 className="text-xl font-black text-slate-950">No followed-team games yet</h2>
+          <p className="mt-2 text-sm font-semibold text-slate-600">
+            {followedCount > 0
+              ? "CourtWatch is waiting for the real Exposure schedule feed for your selected teams. No placeholder games are shown."
+              : "Use Teams search to follow the registered teams you want on this schedule."}
+          </p>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+function FilterButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={clsx(
+        "min-h-10 shrink-0 rounded-lg px-3 text-sm font-black transition active:scale-95",
+        active ? "bg-orange-500 text-white" : "border border-white/12 bg-slate-950 text-slate-200"
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function GameRow({ game }: { game: Game }) {
+  const bracketUrl = bracketUrlFromGame(game);
+  const matchup = gameMatchupDisplayName(game);
+  return (
+    <article className="court-card p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <StatusBadge status={game.status} />
+            <span className="text-xs font-black uppercase tracking-[0.14em] text-slate-400">{game.gameType ?? "Pool"}</span>
+          </div>
+          <h3 className="mt-2 text-lg font-black text-slate-950">{matchup}</h3>
+          <p className="mt-1 text-sm font-semibold text-slate-500">{formatGameDate(game.startsAt, game.timezone)}</p>
+        </div>
+        {game.homeScore !== null && game.awayScore !== null ? (
+          <div className="rounded-lg bg-slate-950 px-3 py-2 text-center text-white">
+            <p className="text-xl font-black">
+              {game.homeScore}-{game.awayScore}
+            </p>
+            <p className="text-[11px] font-bold text-orange-300">FINAL</p>
+          </div>
+        ) : (
+          <div className="rounded-lg bg-orange-500 px-3 py-2 text-center text-white">
+            <p className="text-xl font-black">{game.scheduledTime}</p>
+            <p className="text-[11px] font-bold">{game.courtName ?? "Court TBD"}</p>
+          </div>
+        )}
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2 text-sm font-semibold text-slate-700">
+        <span className="flex items-center gap-1.5">
+          <MapPin className="h-4 w-4 text-orange-500" />
+          {game.venueName ?? "Venue TBD"}
+        </span>
+        <span className="flex items-center gap-1.5">
+          <Gauge className="h-4 w-4 text-orange-500" />
+          {game.courtName ?? "Court TBD"}
+        </span>
+      </div>
+      {bracketUrl ? (
+        <a href={bracketUrl} target="_blank" rel="noreferrer" className="mt-3 inline-flex min-h-10 items-center gap-1 rounded-lg bg-slate-100 px-3 text-sm font-black text-slate-800">
+          <Trophy className="h-4 w-4 text-orange-500" />
+          Official bracket
+          <ChevronRight className="h-4 w-4" />
+        </a>
+      ) : null}
+    </article>
+  );
+}
+
+function TeamsScreen({ dashboard, eventId }: { dashboard: DashboardResponse; eventId: number | null }) {
+  const queryClient = useQueryClient();
+  const [search, setSearch] = useState("");
+  const [focusedTeamId, setFocusedTeamId] = useState<string | null>(null);
+  const deferredSearch = useDeferredValue(search.trim());
+  const selectedProgram = dashboard.programs[0];
+  const teamsQuery = useQuery({
+    queryKey: ["teams", deferredSearch, eventId],
+    queryFn: () => CourtWatchApi.teams(deferredSearch, eventId),
+    enabled: Boolean(eventId)
+  });
+  const allTeamsQuery = useQuery({
+    queryKey: ["teams", "registered-totals", eventId],
+    queryFn: () => CourtWatchApi.teams("", eventId),
+    enabled: Boolean(deferredSearch) && Boolean(eventId),
+    staleTime: 60_000
+  });
+  const refreshSelection = () => {
+    queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+    queryClient.invalidateQueries({ queryKey: ["games"] });
+    queryClient.invalidateQueries({ queryKey: ["alerts"] });
+    queryClient.invalidateQueries({ queryKey: ["results"] });
+    queryClient.invalidateQueries({ queryKey: ["teams"] });
+  };
+  const followTeam = useMutation({
+    mutationFn: (teamId: string) => CourtWatchApi.followTeam(teamId),
+    onSuccess: refreshSelection
+  });
+  const unfollowTeam = useMutation({
+    mutationFn: (teamId: string) => CourtWatchApi.unfollowTeam(teamId),
+    onSuccess: refreshSelection
+  });
+  const teams = teamsQuery.data ?? [];
+  const registeredTeams = deferredSearch ? (allTeamsQuery.data ?? []) : teams;
+  const registeredCountLoading = deferredSearch ? allTeamsQuery.isLoading : teamsQuery.isLoading;
+  const divisionTotals = useMemo(() => divisionTotalsForTeams(registeredTeams), [registeredTeams]);
+  const pendingTeamId = String(followTeam.variables ?? unfollowTeam.variables ?? "");
+  const focusedTeam = selectedProgram?.teams.find((team) => team.id === focusedTeamId) ?? null;
+
+  return (
+    <div className="space-y-4">
+      <section className="court-card p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-xs font-black uppercase tracking-[0.16em] text-orange-600">Team Selection</p>
+            <h2 className="mt-1 text-2xl font-black text-slate-950">{selectedProgram?.teams.length ?? 0} teams followed</h2>
+          </div>
+          <div className="grid h-11 w-11 place-items-center rounded-lg bg-orange-500 text-white">
+            <Search className="h-5 w-5" />
+          </div>
+        </div>
+        <label className="mt-4 flex min-h-12 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 focus-within:border-orange-500">
+          <Search className="h-5 w-5 text-slate-400" />
+          <input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search registered team"
+            className="min-h-11 flex-1 bg-transparent text-base font-semibold text-slate-950 outline-none placeholder:text-slate-400"
+          />
+          {search ? (
+            <button type="button" onClick={() => setSearch("")} className="grid h-9 w-9 place-items-center rounded-lg bg-slate-100 text-slate-500" aria-label="Clear search">
+              <X className="h-4 w-4" />
+            </button>
+          ) : null}
+        </label>
+      </section>
+
+      {selectedProgram && selectedProgram.teams.length > 0 ? (
+        <section className="court-card p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-xl font-black text-slate-950">Following</h2>
+            <span className="rounded-md bg-orange-100 px-2 py-1 text-xs font-black text-orange-700">{selectedProgram.teams.length} active</span>
+          </div>
+          <div className="space-y-2">
+            {selectedProgram.teams.map((team) => (
+              <FollowedTeamRow
+                key={team.id}
+                team={team}
+                focused={focusedTeamId === team.id}
+                onFocus={() => setFocusedTeamId(team.id)}
+                onUnfollow={() => {
+                  if (focusedTeamId === team.id) setFocusedTeamId(null);
+                  unfollowTeam.mutate(team.id);
+                }}
+                pending={unfollowTeam.isPending && pendingTeamId === team.id}
+                eventId={eventId}
+              />
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {focusedTeam ? <TeamFocusPanel team={focusedTeam} eventId={eventId} /> : null}
+
+      <section className="space-y-2">
+        <div className="flex items-center justify-between gap-3 px-1">
+          <h2 className="text-sm font-black uppercase tracking-[0.16em] text-orange-300">{deferredSearch ? "Search Results" : "Registered Teams"}</h2>
+          <span className="shrink-0 rounded-md bg-white/10 px-2.5 py-1 text-xs font-black text-white">
+            {registeredCountLoading ? "..." : `${registeredTeams.length} registered`}
+          </span>
+        </div>
+        <DivisionTotalsPanel totals={divisionTotals} loading={registeredCountLoading} />
+        {teamsQuery.isLoading ? <div className="h-28 animate-pulse rounded-lg bg-white/12" /> : null}
+        {!teamsQuery.isLoading && teams.length === 0 ? (
+          <div className="court-card p-4">
+            <h3 className="text-lg font-black text-slate-950">No matches found</h3>
+            <p className="mt-1 text-sm font-semibold text-slate-600">Try a team name, club name, or division.</p>
+          </div>
+        ) : null}
+        {teams.map((team) => (
+          <TeamSearchCard
+            key={team.id}
+            team={team}
+            onFollow={() => followTeam.mutate(team.id)}
+            onUnfollow={() => unfollowTeam.mutate(team.id)}
+            pending={(followTeam.isPending || unfollowTeam.isPending) && pendingTeamId === team.id}
+          />
+        ))}
+      </section>
+    </div>
+  );
+}
+
+type DivisionTotal = {
+  divisionName: string;
+  count: number;
+};
+
+function DivisionTotalsPanel({ totals, loading }: { totals: DivisionTotal[]; loading: boolean }) {
+  if (loading) {
+    return <div className="h-12 animate-pulse rounded-lg bg-white/12" />;
+  }
+
+  if (totals.length === 0) return null;
+
+  return (
+    <details className="overflow-hidden rounded-lg border border-white/12 bg-white/8 text-white">
+      <summary className="flex min-h-12 cursor-pointer list-none items-center justify-between gap-3 px-3 text-sm font-black">
+        <span>Division totals</span>
+        <span className="rounded-md bg-orange-500 px-2 py-1 text-xs text-white">{totals.length} divisions</span>
+      </summary>
+      <div className="max-h-72 space-y-1 overflow-y-auto border-t border-white/10 p-2">
+        {totals.map((division) => (
+          <div key={division.divisionName} className="flex items-center justify-between gap-3 rounded-md bg-white px-3 py-2 text-slate-900">
+            <span className="min-w-0 text-sm font-black leading-snug">{division.divisionName}</span>
+            <span className="shrink-0 rounded-md bg-slate-950 px-2 py-1 text-xs font-black text-white">{division.count}</span>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function FollowedTeamRow({
+  team,
+  focused,
+  onFocus,
+  onUnfollow,
+  pending,
+  eventId
+}: {
+  team: ProgramSummary["teams"][number];
+  focused: boolean;
+  onFocus: () => void;
+  onUnfollow: () => void;
+  pending: boolean;
+  eventId: number | null;
+}) {
+  const displayName = teamDisplayName(team);
+  return (
+    <article className={clsx("rounded-lg border bg-white p-3", focused ? "border-orange-400 ring-2 ring-orange-100" : "border-slate-200")}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="font-black text-slate-950">{displayName}</p>
+            <FollowerCountBadge count={team.followerCount ?? 0} />
+          </div>
+          <p className="mt-1 text-sm font-semibold text-slate-600">{team.divisionName ?? "Division TBD"}</p>
+          <p className="mt-1 text-xs font-semibold text-slate-500">
+            {team.gender ?? "Any"} / {team.gradeLevel ?? "Grade TBD"} / {team.level ?? "Level TBD"}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onUnfollow}
+          disabled={pending}
+          className="min-h-10 shrink-0 rounded-lg border border-slate-200 px-3 text-xs font-black text-slate-700 active:scale-95 disabled:opacity-60"
+        >
+          {pending ? "..." : "Unfollow"}
+        </button>
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <Metric label="Next" value={team.nextGame ? `${team.nextGame.scheduledTime} ${team.nextGame.courtName ?? "Court TBD"}` : "TBD"} />
+        <Metric label="Last" value={team.lastResult ? scoreSummary(team.lastResult) : "No result"} />
+      </div>
+      <OfficialTeamPageLink sourceUrl={team.sourceUrl} />
+      <TeamBracketLink team={team} eventId={eventId} />
+      <button
+        type="button"
+        onClick={onFocus}
+        className="mt-3 flex min-h-10 w-full items-center justify-center gap-2 rounded-lg bg-slate-950 px-3 text-sm font-black text-white active:scale-[0.99]"
+      >
+        <Trophy className="h-4 w-4 text-orange-300" />
+        Schedule & bracket
+      </button>
+    </article>
+  );
+}
+
+function TeamBracketLink({ team, eventId }: { team: ProgramSummary["teams"][number]; eventId: number | null }) {
+  const divisionGamesQuery = useQuery({
+    queryKey: ["division-games", team.divisionId, eventId],
+    queryFn: () => CourtWatchApi.games(`?scope=division&division=${encodeURIComponent(team.divisionId ?? "")}`, eventId),
+    enabled: Boolean(team.divisionId) && Boolean(eventId),
+    staleTime: 60_000
+  });
+  const bracketUrl = (divisionGamesQuery.data ?? []).map(divisionBracketUrlFromGame).find(Boolean);
+
+  if (divisionGamesQuery.isLoading) {
+    return <div className="mt-3 h-10 animate-pulse rounded-lg bg-slate-100" />;
+  }
+
+  if (!bracketUrl) {
+    return <p className="mt-3 rounded-lg bg-slate-100 px-3 py-2 text-xs font-black text-slate-500">Official bracket not posted yet</p>;
+  }
+
+  return (
+    <a href={bracketUrl} target="_blank" rel="noreferrer" className="mt-3 flex min-h-10 w-full items-center justify-center gap-2 rounded-lg bg-orange-50 px-3 text-sm font-black text-orange-700 active:scale-[0.99]">
+      <Trophy className="h-4 w-4" />
+      Official bracket
+      <ChevronRight className="h-4 w-4" />
+    </a>
+  );
+}
+
+function TeamFocusPanel({ team, eventId }: { team: ProgramSummary["teams"][number]; eventId: number | null }) {
+  const divisionGamesQuery = useQuery({
+    queryKey: ["division-games", team.divisionId, eventId],
+    queryFn: () => CourtWatchApi.games(`?scope=division&division=${encodeURIComponent(team.divisionId ?? "")}`, eventId),
+    enabled: Boolean(team.divisionId) && Boolean(eventId)
+  });
+  const divisionGames = divisionGamesQuery.data ?? [];
+  const teamGames = divisionGames.filter((game) => gameBelongsToTeam(game, team));
+  const bracketGames = divisionGames.filter(isBracketGame);
+  const bracketUrl = divisionGames.map(divisionBracketUrlFromGame).find(Boolean);
+  const displayName = teamDisplayName(team);
+
+  return (
+    <section className="court-card p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-black uppercase tracking-[0.16em] text-orange-600">Focused Team</p>
+          <h2 className="mt-1 text-2xl font-black text-slate-950">{displayName}</h2>
+          <p className="mt-1 text-sm font-semibold text-slate-600">{team.divisionName ?? "Division TBD"}</p>
+          <OfficialTeamPageLink sourceUrl={team.sourceUrl} />
+        </div>
+        <div className="grid h-11 w-11 place-items-center rounded-lg bg-slate-950 text-orange-300">
+          <Trophy className="h-5 w-5" />
+        </div>
+      </div>
+
+      <div className="mt-4 grid grid-cols-2 gap-2">
+        <Metric label="Next court" value={team.nextGame?.courtName ?? "TBD"} />
+        <Metric label="Bracket games" value={divisionGamesQuery.isLoading ? "..." : String(bracketGames.length)} />
+      </div>
+
+      <div className="mt-4">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <h3 className="text-lg font-black text-slate-950">Team Schedule</h3>
+          <span className="rounded-md bg-slate-100 px-2 py-1 text-xs font-black text-slate-600">{teamGames.length} games</span>
+        </div>
+        <MiniGameList games={teamGames} loading={divisionGamesQuery.isLoading} empty="No official games published for this team yet." />
+      </div>
+
+      <div className="mt-4">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <h3 className="text-lg font-black text-slate-950">Division Bracket</h3>
+          {bracketUrl ? (
+            <a href={bracketUrl} target="_blank" rel="noreferrer" className="inline-flex min-h-9 items-center gap-1 rounded-lg bg-orange-500 px-3 text-xs font-black text-white">
+              Official
+              <ChevronRight className="h-4 w-4" />
+            </a>
+          ) : null}
+        </div>
+        <MiniGameList games={bracketGames} loading={divisionGamesQuery.isLoading} empty="No bracket games published for this division yet." />
+      </div>
+    </section>
+  );
+}
+
+function MiniGameList({ games, loading, empty }: { games: Game[]; loading: boolean; empty: string }) {
+  if (loading) return <div className="h-24 animate-pulse rounded-lg bg-slate-100" />;
+  if (games.length === 0) return <p className="rounded-lg bg-slate-100 p-3 text-sm font-semibold text-slate-600">{empty}</p>;
+
+  return (
+    <div className="space-y-2">
+      {games.map((game) => (
+        <article key={game.id} className="rounded-lg border border-slate-200 bg-white p-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <StatusBadge status={game.status} />
+                <span className="truncate text-xs font-black uppercase tracking-[0.14em] text-slate-400">{game.gameType ?? "Pool"}</span>
+              </div>
+              <p className="mt-2 text-sm font-black text-slate-950">
+                {gameMatchupDisplayName(game)}
+              </p>
+              <p className="mt-1 text-xs font-semibold text-slate-500">{formatGameDate(game.startsAt, game.timezone)}</p>
+            </div>
+            <div className="shrink-0 rounded-lg bg-orange-500 px-3 py-2 text-center text-white">
+              <p className="text-sm font-black">{game.scheduledTime}</p>
+              <p className="text-[11px] font-bold">{game.courtName ?? "Court TBD"}</p>
+            </div>
+          </div>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function TeamSearchCard({
+  team,
+  onFollow,
+  onUnfollow,
+  pending
+}: {
+  team: Team;
+  onFollow: () => void;
+  onUnfollow: () => void;
+  pending: boolean;
+}) {
+  const followed = Boolean(team.isFollowed);
+  return (
+    <article className="court-card p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-lg font-black text-slate-950">{teamDisplayName(team)}</p>
+            <FollowerCountBadge count={team.followerCount ?? 0} />
+          </div>
+          <p className="mt-1 text-sm font-semibold text-slate-600">{team.divisionName ?? "Division TBD"}</p>
+          <p className="mt-1 text-xs font-semibold text-slate-500">
+            {team.gender ?? "Any"} / {team.gradeLevel ?? "Grade TBD"} / {team.level ?? "Level TBD"}
+          </p>
+        </div>
+        <button
+          type="button"
+          disabled={pending}
+          onClick={followed ? onUnfollow : onFollow}
+          className={clsx(
+            "min-h-11 shrink-0 rounded-lg px-4 text-sm font-black active:scale-95 disabled:opacity-60",
+            followed ? "border border-slate-200 bg-white text-slate-800" : "bg-orange-500 text-white"
+          )}
+        >
+          {pending ? "..." : followed ? "Following" : "Follow"}
+        </button>
+      </div>
+      <OfficialTeamPageLink sourceUrl={team.sourceUrl} />
+    </article>
+  );
+}
+
+function FollowerCountBadge({ count }: { count: number }) {
+  if (count <= 0) return null;
+  return (
+    <span className="shrink-0 rounded-md bg-orange-100 px-2 py-1 text-[11px] font-black text-orange-700">
+      {count} following
+    </span>
+  );
+}
+
+function OfficialTeamPageLink({ sourceUrl }: { sourceUrl: string | null | undefined }) {
+  if (!sourceUrl) return null;
+
+  return (
+    <a href={sourceUrl} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 text-sm font-black text-orange-600">
+      Official team page
+      <ChevronRight className="h-4 w-4" />
+    </a>
+  );
+}
+
+function AlertsScreen({ alerts, games }: { alerts: GameChangeEvent[]; games: Game[] }) {
+  return (
+    <section className="court-card p-4">
+      <div className="mb-4 flex items-center justify-between">
+        <h2 className="text-2xl font-black text-slate-950">Alerts</h2>
+        <span className="rounded-md bg-orange-100 px-2 py-1 text-xs font-black text-orange-700">{alerts.length} recent</span>
+      </div>
+      <AlertList alerts={alerts} games={games} />
+    </section>
+  );
+}
+
+function AlertList({ alerts, games = [], compact = false }: { alerts: GameChangeEvent[]; games?: Game[]; compact?: boolean }) {
+  const gamesById = useMemo(() => new Map(games.map((game) => [game.id, game])), [games]);
+
+  if (alerts.length === 0) {
+    return <p className="rounded-lg bg-slate-100 p-3 text-sm font-semibold text-slate-600">No alerts yet. CourtWatch is monitoring for changes.</p>;
+  }
+
+  return (
+    <div className="space-y-2">
+      {alerts.map((alert) => {
+        const game = alert.gameId ? (gamesById.get(alert.gameId) ?? null) : null;
+        const display = alertDisplay(alert, game);
+        return (
+          <article key={alert.id} className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-orange-500 text-white">
+                <Bell className="h-4 w-4" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="truncate text-xs font-black uppercase tracking-[0.12em] text-orange-600">{labelStatus(alert.eventType)}</p>
+                  <span className="text-[11px] font-bold text-slate-400">{formatShortTime(alert.createdAt, game?.timezone)}</span>
+                </div>
+                <p className={clsx("mt-1 font-black leading-snug text-slate-950", compact ? "text-sm" : "text-base")}>{display.headline}</p>
+                {display.meta ? <p className="mt-1 text-xs font-semibold leading-5 text-slate-500">{display.meta}</p> : null}
+                {!compact && display.detail ? <p className="mt-2 rounded-lg bg-slate-50 px-3 py-2 text-xs font-semibold leading-5 text-slate-600">{display.detail}</p> : null}
+              </div>
+            </div>
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
+function SettingsScreen({ dashboard, onRefresh, eventId }: { dashboard: DashboardResponse; onRefresh: () => void; eventId: number | null }) {
+  const [adminSecret, setAdminSecret] = useState("");
+  const [pushMessage, setPushMessage] = useState<string | null>(null);
+  const [adminMessage, setAdminMessage] = useState<string | null>(null);
+  const syncMutation = useMutation({
+    mutationFn: () => CourtWatchApi.syncNow(adminSecret, eventId),
+    onSuccess: (result) => {
+      setAdminMessage(`Sync complete: ${result.teamsCount} teams, ${result.gamesCount} games`);
+      onRefresh();
+    },
+    onError: (error) => setAdminMessage(error instanceof Error ? error.message : "Sync failed")
+  });
+
+  const subscribe = async () => {
+    try {
+      const publicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY || "";
+      if (!publicKey) {
+        setPushMessage("VAPID public key is not configured yet.");
+        return;
+      }
+      const subscription = await requestPushSubscription(publicKey);
+      await CourtWatchApi.subscribePush(subscription, Intl.DateTimeFormat().resolvedOptions().timeZone);
+      setPushMessage("Push notifications enabled for this device.");
+    } catch (error) {
+      setPushMessage(error instanceof Error ? error.message : "Unable to enable notifications.");
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <section className="court-card p-4">
+        <h2 className="text-2xl font-black text-slate-950">Settings</h2>
+        <div className="mt-4 space-y-3">
+          <SettingRow icon={Bell} title="Notifications" value="Game changes, scores, courts, brackets" />
+          <SettingRow icon={Clock3} title="Refresh frequency" value="60s during active tournament hours" />
+          <SettingRow icon={Activity} title="Source status" value={`${dashboard.sourceStatus.source} / ${dashboard.sourceStatus.status}`} />
+          <SettingRow icon={Smartphone} title="API URL" value={apiBaseUrl()} />
+        </div>
+        <button type="button" onClick={subscribe} className="mt-4 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-orange-500 px-4 text-sm font-black text-white active:scale-[0.99]">
+          <Bell className="h-4 w-4" />
+          Enable Push Notifications
+        </button>
+        {pushMessage ? <p className="mt-2 text-sm font-semibold text-slate-600">{pushMessage}</p> : null}
+      </section>
+
+      <section className="court-card p-4">
+        <div className="flex items-center gap-2">
+          <ShieldAlert className="h-5 w-5 text-orange-500" />
+          <h2 className="text-lg font-black text-slate-950">Admin Sync</h2>
+        </div>
+        <input
+          value={adminSecret}
+          onChange={(event) => setAdminSecret(event.target.value)}
+          type="password"
+          placeholder="ADMIN_SECRET"
+          className="mt-3 min-h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-950 outline-none focus:border-orange-500"
+        />
+        <button
+          type="button"
+          onClick={() => syncMutation.mutate()}
+          className="mt-3 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-slate-950 px-4 text-sm font-black text-white active:scale-[0.99]"
+        >
+          <RefreshCcw className={clsx("h-4 w-4", syncMutation.isPending && "animate-spin")} />
+          Sync Now
+        </button>
+        {adminMessage ? <p className="mt-2 text-sm font-semibold text-slate-600">{adminMessage}</p> : null}
+      </section>
+
+      <section className="rounded-lg border border-white/12 bg-white/8 p-4 text-sm font-medium leading-6 text-slate-200">
+        {dashboard.disclaimer}
+      </section>
+    </div>
+  );
+}
+
+function SettingRow({ icon: Icon, title, value }: { icon: React.ComponentType<{ className?: string }>; title: string; value: string }) {
+  return (
+    <div className="flex items-center gap-3 rounded-lg border border-slate-200 bg-white p-3">
+      <div className="grid h-9 w-9 place-items-center rounded-lg bg-slate-950 text-orange-300">
+        <Icon className="h-4 w-4" />
+      </div>
+      <div className="min-w-0">
+        <p className="font-black text-slate-950">{title}</p>
+        <p className="truncate text-sm font-semibold text-slate-500">{value}</p>
+      </div>
+    </div>
+  );
+}
+
+function BottomTabs({ activeTab, setActiveTab }: { activeTab: Tab; setActiveTab: (tab: Tab) => void }) {
+  return (
+    <nav className="safe-bottom fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-[#07111f]/95 px-2 pt-2 backdrop-blur">
+      <div className="mx-auto grid max-w-[520px] grid-cols-5 gap-1">
+        {tabs.map((tab) => {
+          const Icon = tab.icon;
+          const active = tab.id === activeTab;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              aria-label={tab.label}
+              onClick={() => setActiveTab(tab.id)}
+              className={clsx(
+                "flex min-h-14 min-w-0 flex-col items-center justify-center gap-0.5 overflow-hidden rounded-lg text-[8px] font-black leading-none transition active:scale-95 sm:text-[11px]",
+                active ? "bg-orange-500 text-white" : "text-slate-300"
+              )}
+            >
+              <Icon className="h-5 w-5" />
+              <span className="block w-full text-center">
+                {tab.id === "dashboard" ? (
+                  <>
+                    Dash
+                    <br />
+                    board
+                  </>
+                ) : (
+                  tab.label
+                )}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </nav>
+  );
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const label = labelStatus(status);
+  const tone =
+    status === "final"
+      ? "bg-slate-900 text-white"
+      : status === "playing_now"
+        ? "bg-emerald-500 text-white"
+        : status === "schedule_changed"
+          ? "bg-amber-400 text-slate-950"
+          : status === "awaiting_bracket"
+            ? "bg-slate-200 text-slate-700"
+            : "bg-orange-500 text-white";
+  return <span className={clsx("rounded-md px-2 py-1 text-[11px] font-black uppercase", tone)}>{label}</span>;
+}
+
+function SkeletonDashboard() {
+  return (
+    <div className="space-y-4">
+      {[0, 1, 2].map((item) => (
+        <div key={item} className="h-36 animate-pulse rounded-lg bg-white/12" />
+      ))}
+    </div>
+  );
+}
+
+function useTournamentTodayKey(timezone: string): string {
+  const [todayKey, setTodayKey] = useState(() => dateKeyInTimeZone(new Date(), timezone));
+
+  useEffect(() => {
+    const update = () => setTodayKey(dateKeyInTimeZone(new Date(), timezone));
+    update();
+    const intervalId = window.setInterval(update, 30_000);
+    window.addEventListener("focus", update);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", update);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [timezone]);
+
+  return todayKey;
+}
+
+function groupGamesByDate(games: Game[], todayKey: string, timezone: string) {
+  const grouped = new Map<string, Game[]>();
+  for (const game of games) {
+    const key = game.scheduledDate;
+    grouped.set(key, [...(grouped.get(key) ?? []), game]);
+  }
+  return Array.from(grouped.entries())
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([date, groupGames]) => ({
+      date,
+      label: scheduleDateSectionLabel(date, todayKey, timezone),
+      games: groupGames.sort((left, right) => new Date(left.startsAt).getTime() - new Date(right.startsAt).getTime())
+    }));
+}
+
+function divisionTotalsForTeams(teams: Team[]): DivisionTotal[] {
+  const counts = new Map<string, number>();
+  for (const team of teams) {
+    const divisionName = team.divisionName?.trim() || "Division TBD";
+    counts.set(divisionName, (counts.get(divisionName) ?? 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .map(([divisionName, count]) => ({ divisionName, count }))
+    .sort((left, right) => divisionSortKey(left.divisionName).localeCompare(divisionSortKey(right.divisionName), "en-US", { numeric: true, sensitivity: "base" }));
+}
+
+function divisionSortKey(divisionName: string): string {
+  const genderRank = divisionName.toLowerCase().startsWith("girls") ? "2" : divisionName.toLowerCase().startsWith("boys") ? "1" : "3";
+  return `${genderRank} ${divisionName}`;
+}
+
+function resultPlacementLabel(result: DivisionResult): string {
+  if (result.placement === 1) return "Champion / 1st / Gold";
+  if (result.placement === 2) return "2nd / Silver";
+  return "3rd / Bronze";
+}
+
+function dashboardTeamIds(dashboard: DashboardResponse): string[] {
+  return Array.from(new Set(dashboard.programs.flatMap((program) => program.teams.map((team) => team.id))));
+}
+
+function dashboardFollowMigrationTeamIds(): string[] {
+  if (typeof window === "undefined") return [];
+  const raw = window.localStorage.getItem("courtwatch:dashboard-follow-migration");
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as { teamIds?: unknown };
+    if (!Array.isArray(parsed.teamIds)) return [];
+    return parsed.teamIds.filter((teamId): teamId is string => typeof teamId === "string");
+  } catch {
+    return [];
+  }
+}
+
+function labelStatus(status: string): string {
+  return status
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+    .replace("Playing Now", "LIVE")
+    .replace("Schedule Changed", "CHANGED")
+    .replace("New Game Added", "NEW GAME");
+}
+
+function formatShortTime(iso: string, timezone = DEFAULT_TOURNAMENT_TIME_ZONE): string {
+  return new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", timeZone: timezone }).format(new Date(iso));
+}
+
+function formatGameDate(iso: string, timezone = DEFAULT_TOURNAMENT_TIME_ZONE): string {
+  return new Intl.DateTimeFormat("en-US", {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: timezone
+  }).format(new Date(iso));
+}
+
+type AlertDisplay = {
+  headline: string;
+  meta: string | null;
+  detail: string | null;
+};
+
+function alertDisplay(alert: GameChangeEvent, game: Game | null): AlertDisplay {
+  const value = objectValue(alert.newValue);
+  const previous = objectValue(alert.previousValue);
+  const headline = alertHeadline(alert, game, value);
+  const meta = alertMeta(game, value);
+  const detail = alertDetail(alert.eventType, game, value, previous);
+
+  return { headline, meta, detail };
+}
+
+function alertHeadline(alert: GameChangeEvent, game: Game | null, value: Record<string, unknown> | null): string {
+  if (game) {
+    if (alert.eventType === "final_score" || alert.eventType === "score_posted") return scoreSummary(game);
+    return gameMatchupDisplayName(game);
+  }
+
+  const matchup = matchupFromValue(value);
+  if (matchup) return matchup;
+
+  if (alert.eventType === "new_team_discovered") {
+    const teamName = readString(value, ["teamName", "name", "team"]);
+    return teamName ? `New team found: ${teamName}` : "New watched team found";
+  }
+
+  return "Watched schedule update";
+}
+
+function alertMeta(game: Game | null, value: Record<string, unknown> | null): string | null {
+  const parts = [
+    game ? formatGameDate(game.startsAt, game.timezone) : formatAlertDate(readString(value, ["startsAt", "scheduledAt", "scheduledTime"])),
+    game?.courtName ?? readString(value, ["courtName", "court"]),
+    game?.venueName ?? readString(value, ["venueName", "venue"])
+  ].filter((part): part is string => Boolean(part));
+
+  return parts.length > 0 ? parts.join(" • ") : null;
+}
+
+function alertDetail(
+  eventType: GameChangeEvent["eventType"],
+  game: Game | null,
+  value: Record<string, unknown> | null,
+  previous: Record<string, unknown> | null
+): string | null {
+  const currentCourt = game?.courtName ?? readString(value, ["courtName", "court"]);
+  const previousCourt = readString(previous, ["courtName", "court"]);
+  const currentVenue = game?.venueName ?? readString(value, ["venueName", "venue"]);
+  const previousVenue = readString(previous, ["venueName", "venue"]);
+  const currentTime = game ? formatGameDate(game.startsAt, game.timezone) : formatAlertDate(readString(value, ["startsAt", "scheduledAt", "scheduledTime"]));
+  const previousTime = formatAlertDate(readString(previous, ["startsAt", "scheduledAt", "scheduledTime"]));
+
+  switch (eventType) {
+    case "new_game_added":
+      return "New game added to your watched schedule.";
+    case "game_time_changed":
+    case "date_changed":
+      return previousTime && currentTime ? `Tip changed from ${previousTime} to ${currentTime}.` : currentTime ? `Tip changed to ${currentTime}.` : "Tip time changed.";
+    case "court_changed":
+      return previousCourt && currentCourt ? `Court changed from ${previousCourt} to ${currentCourt}.` : currentCourt ? `Court changed to ${currentCourt}.` : "Court assignment changed.";
+    case "venue_changed":
+      return previousVenue && currentVenue ? `Venue changed from ${previousVenue} to ${currentVenue}.` : currentVenue ? `Venue changed to ${currentVenue}.` : "Venue changed.";
+    case "opponent_assigned":
+      return "Opponent assignment was posted.";
+    case "score_posted":
+      return "Score was posted by the tournament source.";
+    case "final_score":
+      return "Final score was posted by the tournament source.";
+    case "bracket_update":
+    case "team_advanced":
+      return "Bracket information was updated.";
+    case "starting_soon":
+      return "Game is starting soon.";
+    case "new_team_discovered":
+      return "A team you follow was added to CourtWatch.";
+    case "home_away_changed":
+      return "Home and away assignment changed.";
+    default:
+      return null;
+  }
+}
+
+function matchupFromValue(value: Record<string, unknown> | null): string | null {
+  const home = readString(value, ["homeTeamNameSnapshot", "homeTeamName", "home"]);
+  const away = readString(value, ["awayTeamNameSnapshot", "awayTeamName", "away"]);
+  if (!home && !away) return null;
+  return `${home ?? "TBD"} vs ${away ?? "TBD"}`;
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function readString(value: Record<string, unknown> | null, keys: string[]): string | null {
+  if (!value) return null;
+  for (const key of keys) {
+    const raw = value[key];
+    if (typeof raw === "string" && raw.trim()) return raw.trim();
+    if (typeof raw === "number" && Number.isFinite(raw)) return String(raw);
+  }
+  return null;
+}
+
+function formatAlertDate(value: string | null): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return formatGameDate(date.toISOString());
+}
+
+function scoreSummary(game: Game): string {
+  if (game.homeScore === null || game.awayScore === null) return "No score posted";
+  return `${gameTeamDisplayName(game.homeTeamNameSnapshot, game, "Home")} ${game.homeScore}, ${gameTeamDisplayName(game.awayTeamNameSnapshot, game, "Away")} ${game.awayScore}`;
+}
+
+type TeamNameDisplayInput = Pick<Team, "name" | "divisionName" | "gradeLevel">;
+
+function teamDisplayName(team: TeamNameDisplayInput): string {
+  const ageLabel = splashCityAgeLabel(team.name, team.divisionName, team.gradeLevel);
+  return ageLabel ? `Splash City ${ageLabel}` : team.name;
+}
+
+function gameMatchupDisplayName(game: Game): string {
+  return `${gameTeamDisplayName(game.homeTeamNameSnapshot, game)} vs ${gameTeamDisplayName(game.awayTeamNameSnapshot, game)}`;
+}
+
+function gameTeamDisplayName(name: string | null, game: Game, fallback = "TBD"): string {
+  if (!name) return fallback;
+  const ageLabel = splashCityAgeLabel(name, divisionNameFromGame(game));
+  return ageLabel ? `Splash City ${ageLabel}` : name;
+}
+
+function splashCityAgeLabel(name: string, ...contexts: Array<string | null | undefined>): string | null {
+  if (!isSplashCityName(name)) return null;
+
+  const sources = [name, ...contexts].filter((value): value is string => Boolean(value));
+  return sources.map(extractAgeLabel).find(Boolean) ?? sources.map(extractGradeAgeLabel).find(Boolean) ?? null;
+}
+
+function isSplashCityName(name: string): boolean {
+  const normalized = name.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const compact = normalized.replace(/\s+/g, "");
+  return compact.startsWith("splashcity") || normalized.startsWith("splash city ");
+}
+
+function extractAgeLabel(value: string): string | null {
+  const match = value.match(/\b(\d{1,2})\s*u\b/i);
+  return match ? `${Number(match[1])}U` : null;
+}
+
+function extractGradeAgeLabel(value: string): string | null {
+  const grades = Array.from(value.toLowerCase().matchAll(/\b(\d{1,2})(?:st|nd|rd|th)\s*(?:grade)?\b/g)).map((match) => Number(match[1]));
+  const highestGrade = Math.max(...grades.filter(Number.isFinite));
+  if (!Number.isFinite(highestGrade)) return null;
+  const age = highestGrade + 6;
+  return age >= 6 && age <= 19 ? `${age}U` : null;
+}
+
+function gameBelongsToTeam(game: Game, team: Team): boolean {
+  return game.homeTeamId === team.id || game.awayTeamId === team.id;
+}
+
+function isBracketGame(game: Game): boolean {
+  const gameType = game.gameType?.toLowerCase() ?? "";
+  if (!gameType) return false;
+  if (gameType.startsWith("pool")) return false;
+  return ["championship", "consolation", "play in", "gold", "silver", "bracket"].some((keyword) => gameType.includes(keyword));
+}
+
+function bracketUrlFromGame(game: Game): string | null {
+  if (!game.rawJson || typeof game.rawJson !== "object" || Array.isArray(game.rawJson)) return null;
+  const value = (game.rawJson as { BracketUrl?: unknown }).BracketUrl;
+  return typeof value === "string" && value.startsWith("http") ? value : null;
+}
+
+function divisionBracketUrlFromGame(game: Game): string | null {
+  const gameBracketUrl = bracketUrlFromGame(game);
+  if (gameBracketUrl) return gameBracketUrl;
+  if (!game.rawJson || typeof game.rawJson !== "object" || Array.isArray(game.rawJson)) return null;
+  const links = (game.rawJson as { DivisionBracketUrls?: unknown }).DivisionBracketUrls;
+  if (!Array.isArray(links)) return null;
+  for (const link of links) {
+    if (!link || typeof link !== "object" || Array.isArray(link)) continue;
+    const url = (link as { url?: unknown }).url;
+    if (typeof url === "string" && url.startsWith("http")) return url;
+  }
+  return null;
+}
+
+function divisionNameFromGame(game: Game): string | null {
+  if (!game.rawJson || typeof game.rawJson !== "object" || Array.isArray(game.rawJson)) return null;
+  const raw = game.rawJson as Record<string, unknown>;
+  for (const key of ["DivisionName", "divisionName", "Division", "division", "AgeGroup", "ageGroup"]) {
+    const value = raw[key];
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return null;
+}
