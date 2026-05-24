@@ -39,13 +39,13 @@ If `EXPOSURE_EVENTS` is empty, the app falls back to legacy `EXPOSURE_EVENT_ID` 
 
 ## Public Discovery
 
-The worker calls `POST /api/admin/discover-tournaments` at least daily. Discovery looks from today through today plus 30 days and only saves dropdown-eligible tournaments when:
+The worker calls `POST /api/admin/discover-tournaments` at least daily. Discovery looks from today through today plus 90 days and saves dropdown-eligible tournaments when:
 
 - the source is public and does not require login, payment, CAPTCHA bypass, private API access, or organizer-only permission
 - the event is basketball from an enabled AAU/major tournament source
 - the event is upcoming or active, not completed/cancelled/unavailable
 - the provider exposes a public registered-team list
-- at least one registered team is fetched
+- the registered-team endpoint/page can be fetched publicly; if teams are not posted yet, the dropdown shows `teams not posted yet`
 
 Default sources are configured in `MAJOR_TOURNAMENT_SOURCES`:
 
@@ -56,6 +56,11 @@ MAJOR_TOURNAMENT_SOURCES='[
     "provider": "exposure_events",
     "enabled": true,
     "url": "https://basketball.exposureevents.com/organizations/3461/jam-on-it",
+    "eventUrls": [
+      "https://basketball.exposureevents.com/256931/2026-the-battleground",
+      "https://basketball.exposureevents.com/255723/2026-las-vegas-showtime",
+      "https://basketball.exposureevents.com/255725/2026-grand-finale"
+    ],
     "organizerName": "Jam On It",
     "sanctioningTags": ["Jam On It", "Exposure Events"],
     "timezone": "America/Los_Angeles"
@@ -70,7 +75,7 @@ MAJOR_TOURNAMENT_SOURCES='[
 ]'
 ```
 
-The AAU adapter is intentionally conservative: AAU listings are not shown in the normal dropdown unless a provider can fetch public registered teams. Exposure listings can also be disabled by the platform; when that happens the app logs the provider result and keeps using recent valid cached tournament data.
+The AAU adapter is intentionally conservative: AAU listings are not shown in the normal dropdown unless a provider can fetch a public registered-team endpoint or page. Exposure listings can also be disabled by the platform; when that happens the app logs the provider result and keeps using recent valid cached tournament data. Add known public Exposure tournament URLs to `eventUrls` when an organizer page does not list events publicly.
 
 ## Local Setup
 

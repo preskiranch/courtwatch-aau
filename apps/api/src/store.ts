@@ -662,11 +662,12 @@ export class PrismaStore implements CourtWatchStore {
       teamsCount = after.teams.length;
       gamesCount = after.games.length;
       const syncedAt = new Date();
+      const publicTeamListWasFetched = Boolean(preloadedTeams) || sourceTeams.teams.length > 0;
       await this.prisma.event.update({
         where: { id: event.id },
         data: {
           registeredTeamCount: teamsCount,
-          hasPublicTeamList: sourceTeams.teams.length > 0,
+          hasPublicTeamList: publicTeamListWasFetched,
           lastCheckedAt: syncedAt,
           lastSyncedAt: syncedAt,
           lastTeamChangeAt: haveTeamExternalIdsChanged(previousTeamIds, sourceTeams.teams) ? syncedAt : undefined,
@@ -818,7 +819,7 @@ function dropdownEventsFromSnapshot(events: TournamentEvent[], teams: Team[]): T
     events.map((event) => ({
       ...event,
       registeredTeamCount: teamCounts.get(event.id) ?? 0,
-      hasPublicTeamList: event.hasPublicTeamList && (teamCounts.get(event.id) ?? 0) > 0
+      hasPublicTeamList: event.hasPublicTeamList
     })),
     { cacheHours: config.TOURNAMENT_DROPDOWN_CACHE_HOURS }
   );
@@ -882,7 +883,7 @@ function prismaEventToCore(
     officialUrl: event.officialUrl,
     timezone: source?.timezone ?? RENO_TIMEZONE,
     registeredTeamCount: teamCount ?? event.registeredTeamCount,
-    hasPublicTeamList: event.hasPublicTeamList && (teamCount ?? event.registeredTeamCount) > 0,
+    hasPublicTeamList: event.hasPublicTeamList,
     lastCheckedAt: event.lastCheckedAt?.toISOString() ?? null,
     lastSyncedAt: latestSuccessfulSyncAt ?? event.lastSyncedAt?.toISOString() ?? null,
     lastTeamChangeAt: event.lastTeamChangeAt?.toISOString() ?? null,

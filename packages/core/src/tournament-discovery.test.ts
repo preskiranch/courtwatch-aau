@@ -10,14 +10,14 @@ function jsonResponse(value: unknown) {
 }
 
 describe("TournamentDiscoveryService", () => {
-  it("includes Exposure/Jam On It-style public tournaments only when registered teams are public", async () => {
+  it("includes Exposure/Jam On It-style public tournaments when the public team list is reachable", async () => {
     const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (init?.method === "POST") {
         return jsonResponse({
           Results: [
             { Link: "/910001/jam-on-it-memorial-day-classic" },
-            { Link: "/910002/jam-on-it-no-team-list" },
+            { Link: "/910002/jam-on-it-teams-pending" },
             { Link: "/910001/jam-on-it-memorial-day-classic" }
           ]
         });
@@ -34,10 +34,10 @@ describe("TournamentDiscoveryService", () => {
           Teams: [{ Division: "Boys 8th Level 1", DivisionId: 1, Slug: "reno-hype", Value: 1001, Name: "Reno Hype (Boys 8th Level 1)" }]
         });
       }
-      if (url.endsWith("/910002/jam-on-it-no-team-list/search?eventid=910002&eventname=jam-on-it-no-team-list")) {
+      if (url.endsWith("/910002/jam-on-it-teams-pending/search?eventid=910002&eventname=jam-on-it-teams-pending")) {
         return jsonResponse({ Teams: [] });
       }
-      if (url.endsWith("/910002/jam-on-it-no-team-list/teams")) {
+      if (url.endsWith("/910002/jam-on-it-teams-pending/teams")) {
         return htmlResponse("<html><body><div id=\"content\"></div></body></html>");
       }
       if (url.endsWith("/910001/jam-on-it-memorial-day-classic")) {
@@ -51,12 +51,12 @@ describe("TournamentDiscoveryService", () => {
           </html>
         `);
       }
-      if (url.endsWith("/910002/jam-on-it-no-team-list")) {
+      if (url.endsWith("/910002/jam-on-it-teams-pending")) {
         return htmlResponse(`
           <html>
             <head>
-              <title>Jam On It No Team List - May 26-27, 2026 - Reno, NV</title>
-              <meta name="twitter:title" content="Jam On It No Team List" />
+              <title>Jam On It Teams Pending - May 26-27, 2026 - Reno, NV</title>
+              <meta name="twitter:title" content="Jam On It Teams Pending" />
             </head>
             <body><a href="/organizations/3461/jam-on-it">Jam On It</a></body>
           </html>
@@ -80,7 +80,7 @@ describe("TournamentDiscoveryService", () => {
     );
 
     expect(result.failures).toEqual([]);
-    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates).toHaveLength(2);
     expect(result.candidates[0]?.event).toMatchObject({
       name: "Jam On It Memorial Day Classic",
       exposureEventId: 910001,
@@ -90,6 +90,12 @@ describe("TournamentDiscoveryService", () => {
       hasPublicTeamList: true
     });
     expect(result.candidates[0]?.teams.teams[0]?.name).toBe("Reno Hype");
+    expect(result.candidates[1]?.event).toMatchObject({
+      name: "Jam On It Teams Pending",
+      exposureEventId: 910002,
+      registeredTeamCount: 0,
+      hasPublicTeamList: true
+    });
   });
 
   it("does not crash dropdown discovery when a provider fails", async () => {

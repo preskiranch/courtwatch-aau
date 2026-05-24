@@ -37,7 +37,7 @@ export class PublicExposurePageClient {
 
   async fetchTeams(eventId: number, eventSlug = "2026-reno-memorial-day-tournament", timezone = DEFAULT_TOURNAMENT_TIMEZONE): Promise<PublicExposureTeamResult> {
     const searchResult = await this.fetchSearch(eventId, eventSlug).catch(() => null);
-    if (searchResult?.Teams?.length) {
+    if (Array.isArray(searchResult?.Teams)) {
       const divisions = new Map<string, Division>();
       const teams: Team[] = [];
 

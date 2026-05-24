@@ -41,7 +41,7 @@ describe("CourtWatch API", () => {
     expect(renoDashboard.body.programs[0].teams).toHaveLength(0);
   });
 
-  it("hides tournaments without registered teams from the selector", async () => {
+  it("hides unsynced tournaments without recent public team-list data from the selector", async () => {
     const snapshot = structuredClone(seedSnapshot);
     snapshot.events.push({
       ...seedSnapshot.event,
@@ -54,6 +54,7 @@ describe("CourtWatch API", () => {
       officialUrl: "https://basketball.exposureevents.com/910000/empty-aau-classic",
       registeredTeamCount: 0,
       hasPublicTeamList: true,
+      lastCheckedAt: null,
       lastSyncedAt: null
     });
     const app = createApp(new MockStore(snapshot), null);
@@ -61,7 +62,7 @@ describe("CourtWatch API", () => {
     expect(events.body.map((event: { exposureEventId: number }) => event.exposureEventId)).toEqual([255539, 900001]);
   });
 
-  it("only returns eligible dropdown tournaments from public team-list sources", async () => {
+  it("returns public-source dropdown tournaments up to 90 days out even before teams post", async () => {
     const eligible = eventFixture(910001, {
       name: "Jam On It Memorial Day Classic",
       organizer: "Jam On It",
@@ -78,7 +79,8 @@ describe("CourtWatch API", () => {
       startDate: "2026-05-25",
       hasPublicTeamList: true
     });
-    const farAway = eventFixture(910002, { name: "Too Far Classic", startDate: "2026-07-01", endDate: "2026-07-02", hasPublicTeamList: true });
+    const within90Days = eventFixture(910002, { name: "Within 90 Days Classic", startDate: "2026-07-01", endDate: "2026-07-02", hasPublicTeamList: true });
+    const tooFarAway = eventFixture(910008, { name: "Too Far Classic", startDate: "2026-08-25", endDate: "2026-08-26", hasPublicTeamList: true });
     const noPublicTeams = eventFixture(910003, { name: "AAU Event Finder Listing", externalProvider: "aau_event_finder", hasPublicTeamList: false });
     const zeroTeams = eventFixture(910004, { name: "Zero Team Classic", hasPublicTeamList: true });
     const completed = eventFixture(910005, { name: "Completed Classic", startDate: "2026-05-20", endDate: "2026-05-21", hasPublicTeamList: true, status: "completed" });
@@ -87,16 +89,21 @@ describe("CourtWatch API", () => {
     const snapshot = {
       ...structuredClone(seedSnapshot),
       event: eligible,
-      events: [eligible, duplicate, farAway, noPublicTeams, zeroTeams, completed, cancelled, unavailable],
-      teams: [teamFixture(eligible), teamFixture(duplicate), teamFixture(farAway), teamFixture(noPublicTeams), teamFixture(completed), teamFixture(cancelled), teamFixture(unavailable)]
+      events: [eligible, duplicate, within90Days, tooFarAway, noPublicTeams, zeroTeams, completed, cancelled, unavailable],
+      teams: [teamFixture(eligible), teamFixture(duplicate), teamFixture(within90Days), teamFixture(tooFarAway), teamFixture(noPublicTeams), teamFixture(completed), teamFixture(cancelled), teamFixture(unavailable)]
     };
     const app = createApp(new MockStore(snapshot), null);
     const events = await request(app).get("/api/events").expect(200);
 
-    expect(events.body.map((event: { name: string }) => event.name)).toEqual(["Jam On It Memorial Day Classic"]);
+    expect(events.body.map((event: { name: string }) => event.name)).toEqual(["Jam On It Memorial Day Classic", "Zero Team Classic", "Within 90 Days Classic"]);
     expect(events.body[0]).toMatchObject({
       name: "Jam On It Memorial Day Classic",
       registeredTeamCount: 1,
+      hasPublicTeamList: true
+    });
+    expect(events.body[1]).toMatchObject({
+      name: "Zero Team Classic",
+      registeredTeamCount: 0,
       hasPublicTeamList: true
     });
   });

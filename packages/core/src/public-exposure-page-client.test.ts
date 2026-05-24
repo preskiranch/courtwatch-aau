@@ -43,6 +43,18 @@ describe("PublicExposurePageClient", () => {
     });
   });
 
+  it("treats an empty public search result as a reachable team list", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ Teams: [], Players: [] })) as unknown as typeof fetch;
+
+    const result = await new PublicExposurePageClient({ baseUrl: "https://basketball.exposureevents.com", fetchImpl }).fetchTeams(255723, "2026-las-vegas-showtime");
+
+    expect(result).toEqual({ divisions: [], teams: [] });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(String(fetchImpl.mock.calls[0]?.[0])).toBe(
+      "https://basketball.exposureevents.com/255723/2026-las-vegas-showtime/search?eventid=255723&eventname=2026-las-vegas-showtime"
+    );
+  });
+
   it("maps public eventgames into real games with courts and bracket links without inventing finals", async () => {
     const fetchImpl = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);

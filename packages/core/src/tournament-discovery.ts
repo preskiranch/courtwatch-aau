@@ -58,6 +58,11 @@ export const DEFAULT_MAJOR_TOURNAMENT_SOURCES: MajorTournamentSource[] = [
     provider: "exposure_events",
     enabled: true,
     url: "https://basketball.exposureevents.com/organizations/3461/jam-on-it",
+    eventUrls: [
+      "https://basketball.exposureevents.com/256931/2026-the-battleground",
+      "https://basketball.exposureevents.com/255723/2026-las-vegas-showtime",
+      "https://basketball.exposureevents.com/255725/2026-grand-finale"
+    ],
     organizerName: "Jam On It",
     sanctioningTags: ["Jam On It", "Exposure Events"],
     timezone: DEFAULT_TOURNAMENT_TIMEZONE
@@ -102,7 +107,6 @@ export class TournamentDiscoveryService {
 
           try {
             const teams = await provider.fetchRegisteredTeams(event);
-            if (teams.teams.length === 0) continue;
             candidates.push({
               event: {
                 ...event,

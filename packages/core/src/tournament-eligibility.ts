@@ -1,6 +1,7 @@
 import type { TournamentEvent, TournamentEventStatus } from "./types.js";
 
-export const UPCOMING_TOURNAMENT_WINDOW_DAYS = 30;
+export const UPCOMING_PUBLIC_TOURNAMENT_LOOKAHEAD_DAYS = 90;
+export const UPCOMING_TOURNAMENT_WINDOW_DAYS = UPCOMING_PUBLIC_TOURNAMENT_LOOKAHEAD_DAYS;
 export const DEFAULT_DROPDOWN_CACHE_HOURS = 48;
 
 export interface TournamentDropdownEligibilityOptions {
@@ -14,7 +15,7 @@ export function tournamentTodayKey(now = new Date()): string {
   return process.env.COURTWATCH_TODAY?.trim() || now.toISOString().slice(0, 10);
 }
 
-export function tournamentWindowEndKey(todayKey = tournamentTodayKey(), windowDays = UPCOMING_TOURNAMENT_WINDOW_DAYS): string {
+export function tournamentWindowEndKey(todayKey = tournamentTodayKey(), windowDays = UPCOMING_PUBLIC_TOURNAMENT_LOOKAHEAD_DAYS): string {
   return addDaysToDateKey(todayKey, windowDays);
 }
 
@@ -27,7 +28,7 @@ export function deriveTournamentStatus(event: Pick<TournamentEvent, "startDate" 
 
 export function isTournamentDropdownEligible(event: TournamentEvent, options: TournamentDropdownEligibilityOptions = {}): boolean {
   const todayKey = options.todayKey ?? tournamentTodayKey(options.now);
-  const windowEndKey = tournamentWindowEndKey(todayKey, options.windowDays ?? UPCOMING_TOURNAMENT_WINDOW_DAYS);
+  const windowEndKey = tournamentWindowEndKey(todayKey, options.windowDays ?? UPCOMING_PUBLIC_TOURNAMENT_LOOKAHEAD_DAYS);
   const status = deriveTournamentStatus(event, todayKey);
   const hasValidCache = hasRecentSuccessfulTournamentData(event, {
     now: options.now,
@@ -39,7 +40,6 @@ export function isTournamentDropdownEligible(event: TournamentEvent, options: To
     event.endDate >= todayKey &&
     event.startDate <= windowEndKey &&
     event.hasPublicTeamList &&
-    event.registeredTeamCount > 0 &&
     hasValidCache
   );
 }

@@ -304,7 +304,7 @@ function AppHeader({
           className="h-11 w-full rounded-lg border border-white/12 bg-slate-950 px-3 text-sm font-black text-white"
           disabled={events.length === 0}
         >
-          {events.length === 0 ? <option value="">No upcoming tournaments with public registered teams found</option> : null}
+          {events.length === 0 ? <option value="">No upcoming public-source tournaments found</option> : null}
           {hasGroupedEvents ? (
             <>
               <optgroup label="My tracked events">
@@ -312,7 +312,7 @@ function AppHeader({
                   <TournamentOption key={event.exposureEventId} event={event} />
                 ))}
               </optgroup>
-              <optgroup label="Upcoming tournaments with registered teams">
+              <optgroup label="Upcoming public-source tournaments">
                 {discoveredEvents.map((event) => (
                   <TournamentOption key={event.exposureEventId} event={event} />
                 ))}
@@ -341,7 +341,8 @@ function TournamentOption({ event }: { event: TournamentEvent }) {
 function tournamentOptionLabel(event: TournamentEvent): string {
   const place = event.city && event.state ? `${event.city}, ${event.state}` : event.location;
   const date = compactTournamentDate(event.startDate, event.timezone);
-  return `${event.name} — ${place} — ${date} — ${event.registeredTeamCount} teams`;
+  const teamLabel = event.registeredTeamCount > 0 ? `${event.registeredTeamCount} teams` : "teams not posted yet";
+  return `${event.name} — ${place} — ${date} — ${teamLabel}`;
 }
 
 function compactTournamentDate(dateKey: string, timeZone = DEFAULT_TOURNAMENT_TIME_ZONE): string {
@@ -1320,9 +1321,9 @@ function NoTournamentEvents() {
   return (
     <section className="rounded-lg bg-white p-5 text-slate-950 shadow-sm">
       <p className="text-xs font-black uppercase tracking-[0.16em] text-orange-600">Tournament</p>
-      <h2 className="mt-2 text-xl font-black">No upcoming tournaments with public registered teams found in the next 30 days.</h2>
+      <h2 className="mt-2 text-xl font-black">No upcoming public-source tournaments found in the next 90 days.</h2>
       <p className="mt-2 text-sm font-semibold leading-6 text-slate-600">
-        CourtWatch only lists events after a public organizer or platform source exposes both tournament details and at least one registered team.
+        CourtWatch only lists events after a public organizer or platform source exposes tournament details and a public team-list endpoint or page.
       </p>
     </section>
   );
