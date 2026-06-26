@@ -1,8 +1,13 @@
+import type { TeamScoringLeader } from "./scoring-leaders.js";
+
 export const DEFAULT_TOURNAMENT_TIMEZONE = "America/Los_Angeles";
 export const RENO_TIMEZONE = DEFAULT_TOURNAMENT_TIMEZONE;
 export const SELECTED_TEAMS_PROGRAM_ID = "program-selected-teams";
 export const SELECTED_TEAMS_PROGRAM_NAME = "My Teams";
-export const LEGACY_AUTO_PROGRAM_IDS = ["program-arsenal", "program-splash-city"];
+export const LEGACY_AUTO_PROGRAM_IDS = [
+  "program-arsenal",
+  "program-splash-city",
+];
 
 export type GameStatus =
   | "upcoming"
@@ -25,14 +30,23 @@ export type ChangeEventType =
   | "home_away_changed"
   | "score_posted"
   | "final_score"
+  | "final_placement"
   | "bracket_update"
   | "team_advanced"
   | "starting_soon";
 
 export type ResultPlacement = 1 | 2 | 3;
 export type ResultMedalLabel = "Gold" | "Silver" | "Bronze";
-export type ResultSource = "official_standings" | "bracket_final" | "manual_admin";
-export type TournamentEventStatus = "upcoming" | "active" | "completed" | "unavailable" | "cancelled";
+export type ResultSource =
+  | "official_standings"
+  | "bracket_final"
+  | "manual_admin";
+export type TournamentEventStatus =
+  | "upcoming"
+  | "active"
+  | "completed"
+  | "unavailable"
+  | "cancelled";
 
 export interface TournamentEvent {
   id: string;
@@ -97,9 +111,51 @@ export interface Team {
   lastSeenAt: string;
   createdAt?: string;
   updatedAt?: string;
+  exposureEventId?: number;
+  eventName?: string;
+  eventLocation?: string | null;
   playerNames?: string[];
   isFollowed?: boolean;
   followerCount?: number;
+  record?: TeamRecordSummary;
+}
+
+export interface FavoriteTeamWatch {
+  id: string;
+  displayName: string;
+  normalizedName: string;
+  source: "registered" | "custom";
+  sourceTeamId: string | null;
+  sourceTeamName: string | null;
+  eventName: string | null;
+  divisionName: string | null;
+  gender: string | null;
+  gradeLevel: string | null;
+  level: string | null;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FavoriteTeamWatchInput {
+  displayName: string;
+  sourceTeamId?: string | null;
+  sourceTeamName?: string | null;
+  eventName?: string | null;
+  divisionName?: string | null;
+  gender?: string | null;
+  gradeLevel?: string | null;
+  level?: string | null;
+}
+
+export interface TeamRecordSummary {
+  wins: number;
+  losses: number;
+  ties: number;
+  gamesScored: number;
+  totalPoints: number;
+  finalGames: number;
+  gamesSeen: number;
 }
 
 export interface Player {
@@ -164,12 +220,29 @@ export interface Game {
   awayTeamNameSnapshot: string | null;
   homeScore: number | null;
   awayScore: number | null;
+  homeTeamRecord?: TeamRecordSummary;
+  awayTeamRecord?: TeamRecordSummary;
   status: GameStatus;
   officialUrl: string | null;
   streamingUrl: string | null;
   updatedAt: string;
   sourceHash: string;
   rawJson?: unknown;
+}
+
+export interface CourtFinderGame {
+  game: Game;
+  division: Division | null;
+}
+
+export interface CourtSummary {
+  courtKey: string;
+  courtName: string;
+  venueName: string | null;
+  currentGames: CourtFinderGame[];
+  upNextGame: CourtFinderGame | null;
+  recentGame: CourtFinderGame | null;
+  games: CourtFinderGame[];
 }
 
 export interface GameChangeEvent {
@@ -214,6 +287,17 @@ export interface SyncRun {
   errorMessage: string | null;
 }
 
+export interface SyncStatus {
+  scope: "event" | "all";
+  exposureEventId: number | null;
+  lastSyncedAt: string | null;
+  lastCheckedAt: string | null;
+  lastTeamChangeAt: string | null;
+  latestChangeAt: string | null;
+  latestSuccessfulSyncAt: string | null;
+  fingerprint: string;
+}
+
 export interface DivisionResult {
   id: string;
   eventId: string;
@@ -234,6 +318,7 @@ export interface DivisionResult {
   sourceHash: string;
   rawJson?: unknown;
   lastSeenAt: string;
+  record?: TeamRecordSummary;
 }
 
 export interface DivisionResultGroup {
@@ -271,6 +356,7 @@ export interface DashboardResponse {
   events: TournamentEvent[];
   nextGame: Game | null;
   programs: ProgramSummary[];
+  pointsLeaders: TeamScoringLeader[];
   alerts: GameChangeEvent[];
   lastUpdated: string | null;
   sourceStatus: {
@@ -298,4 +384,4 @@ export interface CourtWatchSnapshot {
 }
 
 export const DISCLAIMER =
-  "CourtWatch AAU is an independent companion tracker and is not affiliated with Jam On It, AAU, or Exposure Events. Official schedules and rulings come from tournament staff.";
+  "Court Watch AAU is an independent companion tracker and is not affiliated with Jam On It, AAU, or Exposure Events. Official schedules and rulings come from tournament staff.";

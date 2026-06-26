@@ -1,7 +1,7 @@
 {
-  "name": "CourtWatch AAU",
-  "short_name": "CourtWatch AAU",
-  "description": "Mobile multi-tournament AAU basketball tracker for selected teams.",
+  "name": "Court Watch AAU",
+  "short_name": "Court AAU",
+  "description": "Mobile AAU tournament tracker for selected teams.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

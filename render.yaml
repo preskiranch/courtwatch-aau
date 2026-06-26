@@ -1,15 +1,15 @@
 databases:
-  - name: courtwatch-aau-db
-    databaseName: courtwatch_aau
-    user: courtwatch_aau
+  - name: courtwatch-reno-db
+    databaseName: courtwatch_reno
+    user: courtwatch_reno
     plan: basic-256mb
 
 services:
   - type: web
-    name: courtwatch-aau-web
+    name: courtwatch-reno-web
     runtime: node
     plan: starter
-    repo: https://github.com/preskiranch/courtwatch-aau
+    repo: https://github.com/preskiranch/courtwatch-reno
     branch: main
     rootDir: .
     buildCommand: npm ci --include=dev && npm run build --workspace @courtwatch/core && npm run build --workspace @courtwatch/web
@@ -19,21 +19,23 @@ services:
       - key: NODE_ENV
         value: production
       - key: WEB_BASE_URL
-        value: https://courtwatch-aau-web.onrender.com
+        value: https://courtwatch-reno-web.onrender.com
       - key: API_BASE_URL
-        value: https://courtwatch-aau-api.onrender.com
+        value: https://courtwatch-reno-api.onrender.com
       - key: NEXT_PUBLIC_API_BASE_URL
-        value: https://courtwatch-aau-api.onrender.com
+        value: https://courtwatch-reno-api.onrender.com
+      - key: NEXT_PUBLIC_SITE_URL
+        value: https://app.courtwatchaau.com
       - key: VAPID_PUBLIC_KEY
         sync: false
       - key: NEXT_PUBLIC_VAPID_PUBLIC_KEY
         sync: false
 
   - type: web
-    name: courtwatch-aau-api
+    name: courtwatch-reno-api
     runtime: node
     plan: starter
-    repo: https://github.com/preskiranch/courtwatch-aau
+    repo: https://github.com/preskiranch/courtwatch-reno
     branch: main
     rootDir: .
     buildCommand: npm ci --include=dev && npm run db:generate && npm run db:migrate && npm run build --workspace @courtwatch/core && npm run build --workspace @courtwatch/db && npm run build --workspace @courtwatch/api
@@ -45,16 +47,20 @@ services:
         value: production
       - key: DATABASE_URL
         fromDatabase:
-          name: courtwatch-aau-db
+          name: courtwatch-reno-db
           property: connectionString
       - key: WEB_BASE_URL
-        value: https://courtwatch-aau-web.onrender.com
+        value: https://courtwatchaau.com
+      - key: WEB_ALLOWED_ORIGINS
+        value: https://courtwatch-reno-web.onrender.com,https://courtwatchaau.com,https://www.courtwatchaau.com,https://app.courtwatchaau.com
       - key: API_BASE_URL
-        value: https://courtwatch-aau-api.onrender.com
+        value: https://courtwatch-reno-api.onrender.com
+      - key: EXPOSURE_EVENT_ID
+        value: "255539"
+      - key: EXPOSURE_EVENT_SLUG
+        value: 2026-reno-memorial-day-tournament
       - key: DEFAULT_EXPOSURE_EVENT_ID
         value: "255539"
-      - key: EXPOSURE_EVENTS
-        sync: false
       - key: EXPOSURE_API_KEY
         sync: false
       - key: EXPOSURE_SECRET_KEY
@@ -62,9 +68,31 @@ services:
       - key: EXPOSURE_PUBLIC_BASE_URL
         value: https://basketball.exposureevents.com
       - key: EXPOSURE_PUBLIC_FETCH_ALL_GAMES
-        value: "false"
+        value: "true"
       - key: EXPOSURE_PUBLIC_REQUEST_DELAY_MS
         value: "125"
+      - key: EXPOSURE_PUBLIC_GAMES_CONCURRENCY
+        value: "4"
+      - key: EXPOSURE_PUBLIC_TIMEOUT_MS
+        value: "12000"
+      - key: EXPOSURE_API_TIMEOUT_MS
+        value: "12000"
+      - key: ACTIVE_GAME_HYDRATION_STALE_MS
+        value: "90000"
+      - key: RECENTLY_COMPLETED_HYDRATION_DAYS
+        value: "3"
+      - key: TOURNAMENT_DISCOVERY_ENABLED
+        value: "true"
+      - key: TOURNAMENT_DISCOVERY_INTERVAL_HOURS
+        value: "6"
+      - key: TOURNAMENT_DISCOVERY_WINDOW_DAYS
+        value: "183"
+      - key: TOURNAMENT_DROPDOWN_CACHE_HOURS
+        value: "720"
+      - key: TOURNAMENT_DISCOVERY_REQUEST_DELAY_MS
+        value: "125"
+      - key: TOURNAMENT_DISCOVERY_RESPECT_ROBOTS
+        value: "true"
       - key: ENABLE_MOCK_ARSENAL
         value: "false"
       - key: ENABLE_MOCK_DATA
@@ -81,12 +109,18 @@ services:
         generateValue: true
       - key: EXPO_ACCESS_TOKEN
         sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: PASSWORD_RESET_FROM_EMAIL
+        value: Court Watch AAU <no-reply@courtwatchaau.com>
+      - key: PASSWORD_RESET_EXPOSE_TOKEN
+        value: "false"
 
   - type: worker
-    name: courtwatch-aau-sync-worker
+    name: courtwatch-reno-sync-worker
     runtime: node
     plan: starter
-    repo: https://github.com/preskiranch/courtwatch-aau
+    repo: https://github.com/preskiranch/courtwatch-reno
     branch: main
     rootDir: .
     buildCommand: npm ci --include=dev && npm run db:generate && npm run build --workspace @courtwatch/core && npm run build --workspace @courtwatch/db && npm run build --workspace @courtwatch/worker
@@ -97,19 +131,33 @@ services:
         value: production
       - key: DATABASE_URL
         fromDatabase:
-          name: courtwatch-aau-db
+          name: courtwatch-reno-db
           property: connectionString
       - key: API_BASE_URL
-        value: https://courtwatch-aau-api.onrender.com
+        value: https://courtwatch-reno-api.onrender.com
       - key: ADMIN_SECRET
         fromService:
-          name: courtwatch-aau-api
+          name: courtwatch-reno-api
           type: web
           envVarKey: ADMIN_SECRET
+      - key: EXPOSURE_EVENT_ID
+        value: "255539"
+      - key: EXPOSURE_EVENT_SLUG
+        value: 2026-reno-memorial-day-tournament
       - key: DEFAULT_EXPOSURE_EVENT_ID
         value: "255539"
-      - key: EXPOSURE_EVENTS
-        sync: false
+      - key: TOURNAMENT_DISCOVERY_INTERVAL_HOURS
+        value: "6"
+      - key: WORKER_API_TIMEOUT_MS
+        value: "300000"
+      - key: WORKER_SYNC_BATCH_SIZE
+        value: "24"
+      - key: WORKER_SYNC_CONCURRENCY
+        value: "3"
+      - key: WORKER_ACTIVE_GAME_STALE_MS
+        value: "90000"
+      - key: EXPOSURE_PUBLIC_GAMES_CONCURRENCY
+        value: "4"
       - key: ENABLE_MOCK_ARSENAL
         value: "false"
       - key: ENABLE_MOCK_DATA
