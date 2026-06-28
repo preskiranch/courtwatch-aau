@@ -7,6 +7,7 @@ import type {
   ProgramSummary,
   Team,
 } from "./types.js";
+import { uniqueAlertEvents } from "./alert-dedupe.js";
 import { DISCLAIMER } from "./types.js";
 import {
   isCurrentOrFutureGame,
@@ -237,7 +238,7 @@ export function watchedAlertEvents(
   watchedGameIds: Set<string>,
   activeProgramIds: Set<string>,
 ): GameChangeEvent[] {
-  return changeEvents.filter((event) => {
+  return uniqueAlertEvents(changeEvents.filter((event) => {
     if (
       event.affectedProgramWatchlistId &&
       !activeProgramIds.has(event.affectedProgramWatchlistId)
@@ -247,7 +248,7 @@ export function watchedAlertEvents(
       return true;
     if (event.gameId && watchedGameIds.has(event.gameId)) return true;
     return false;
-  });
+  }));
 }
 
 export function watchedFinalPlacementAlertEvents(
@@ -268,14 +269,7 @@ export function watchedFinalPlacementAlertEvents(
 }
 
 function mergeAlertEvents(...groups: GameChangeEvent[][]): GameChangeEvent[] {
-  const alerts = new Map<string, GameChangeEvent>();
-  for (const group of groups) {
-    for (const alert of group) {
-      const key = alert.dedupeKey || alert.id;
-      if (!alerts.has(key)) alerts.set(key, alert);
-    }
-  }
-  return Array.from(alerts.values()).sort(
+  return uniqueAlertEvents(groups.flat()).sort(
     (left, right) =>
       new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime(),
   );

@@ -1,5 +1,5 @@
 import type { PrismaClient } from "@courtwatch/db";
-import { formatNotification, notificationHash } from "@courtwatch/core";
+import { formatNotification, legacyNotificationHash, notificationHash } from "@courtwatch/core";
 import type { Game, GameChangeEvent, Team } from "@courtwatch/core";
 import webpush from "web-push";
 import { config } from "./config.js";
@@ -61,8 +61,22 @@ export class NotificationService {
         const team = change.affectedTeam ? prismaTeamToCore(change.affectedTeam) : null;
         const message = formatNotification(coreEvent, game, team);
         const dedupeKey = notificationHash(coreEvent, user.id, "web_push");
-        const existing = await this.prisma.notificationLog.findUnique({
-          where: { userId_dedupeKey_channel: { userId: user.id, dedupeKey, channel: "web_push" } }
+        const legacyDedupeKey = legacyNotificationHash(coreEvent, user.id, "web_push");
+        const dedupeKeys = [...new Set([dedupeKey, legacyDedupeKey])];
+        const recentDuplicateWindow = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const existing = await this.prisma.notificationLog.findFirst({
+          where: {
+            userId: user.id,
+            channel: "web_push",
+            OR: [
+              { dedupeKey: { in: dedupeKeys } },
+              {
+                title: message.title,
+                body: message.body,
+                sentAt: { gte: recentDuplicateWindow }
+              }
+            ]
+          }
         });
         if (existing) {
           skipped += 1;

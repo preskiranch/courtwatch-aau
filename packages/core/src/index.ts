@@ -2,6 +2,7 @@ export * from "./types.js";
 export * from "./normalization.js";
 export * from "./matcher.js";
 export * from "./change-detection.js";
+export * from "./alert-dedupe.js";
 export * from "./notification.js";
 export * from "./polling.js";
 export * from "./dashboard.js";

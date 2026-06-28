@@ -1,4 +1,5 @@
 import type { ChangeEventType, Game, GameChangeEvent, Team } from "./types.js";
+import { alertSemanticKey } from "./alert-dedupe.js";
 import { dedupeKey } from "./change-detection.js";
 
 const PREF_BY_EVENT: Record<ChangeEventType, string> = {
@@ -19,6 +20,10 @@ const PREF_BY_EVENT: Record<ChangeEventType, string> = {
 };
 
 export function notificationHash(event: GameChangeEvent, userId: string, channel: "web_push" | "expo"): string {
+  return dedupeKey([userId, channel, alertSemanticKey(event)]);
+}
+
+export function legacyNotificationHash(event: GameChangeEvent, userId: string, channel: "web_push" | "expo"): string {
   return dedupeKey([userId, channel, event.dedupeKey]);
 }
 
